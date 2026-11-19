@@ -1,0 +1,136 @@
+# ==========================================
+# 1. Environment Variables & Secrets
+# ==========================================
+.env
+.env.*
+!.env.example
+!.env.template
+*.pem
+*.key
+secrets.json
+credentials.json
+
+# ==========================================
+# 2. Python Virtual Environments
+# ==========================================
+venv/
+.venv/
+env/
+ENV/
+virtualenv/
+
+# ==========================================
+# 3. Python Cache & Compiled Files
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+
+# ==========================================
+# 4. VS Code & IDE Settings
+# ==========================================
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+*.code-workspace
+
+# ==========================================
+# 5. Jupyter Notebooks
+# ==========================================
+.ipynb_checkpoints/
+.profile_default/
+
+# ==========================================
+# 6. Testing & Code Coverage
+# ==========================================
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+test-results/
+
+# ==========================================
+# 7. Linting & Type Checking
+# ==========================================
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+
+# ==========================================
+# 8. ChromaDB & Vector Storage
+# ==========================================
+storage/chroma/
+chroma_db/
+chroma_data/
+*.index
+*.faiss
+
+# ==========================================
+# 9. Local Databases
+# ==========================================
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+
+# ==========================================
+# 10. Logs & Debugging
+# ==========================================
+*.log
+logs/
+debug.log
+
+# ==========================================
+# 11. Build & Distribution Files
+# ==========================================
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# ==========================================
+# 12. Operating System Files
+# ==========================================
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ==========================================
+# 13. Temporary Files
+# ==========================================
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+.cache/
+
+# ==========================================
+# 14. Generated Model Files
+# ==========================================
+models/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+
+# ==========================================
+# 15. Local Application Data
+# ==========================================
+storage/
+artifacts/
+outputs/
+uploads/

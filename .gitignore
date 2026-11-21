@@ -92,7 +92,6 @@ debug.log
 # ==========================================
 # 11. Build & Distribution Files
 # ==========================================
-build/
 dist/
 *.egg-info/
 .eggs/

@@ -1,0 +1,5 @@
+Source language: $language
+
+<customer_ticket>
+$ticket
+</customer_ticket>

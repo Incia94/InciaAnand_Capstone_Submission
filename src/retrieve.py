@@ -1,0 +1,551 @@
+"""Retrieve: find the documentation passages that bear on a ticket, or nothing.
+
+Build Specification (Retrieve) -> where it is met                         -> tests (tests/test_retrieve.py)
+-------------------------------------------------------------------------------------------------------------
+Ranked passages with scores                       Retriever.retrieve -> RetrievalResult.passages  test_req1_*
+Identifiers resolve to the real corpus            Corpus: every id checked against documentation.json test_req2_*
+Relevance threshold: nothing rather than noise     thresholds calibrated from labelled tickets   test_req3_*
+Chunking strategy chosen and justified             `compare` measures all four strategies        test_req4_*
+
+Usage (run from the project root, after `python -m src.ingest docs`)
+-----
+    python -m src.retrieve search "my api key suddenly returns 401"
+    python -m src.retrieve calibrate                       # sets thresholds from development tickets
+    python -m src.retrieve evaluate --tickets data/validation_tickets.json
+    python -m src.retrieve compare --backend dense         # chunking strategies, real embeddings
+    python -m src.retrieve compare --backend lexical       # same, word matching (no model needed)
+
+Backends
+--------
+dense    all-MiniLM-L6-v2 embeddings in Chroma (built by `python -m src.ingest docs`). Primary.
+lexical  TF-IDF over words and character n-grams, built in memory from documentation.json.
+         Needs no model and no network, so it is the fallback when the dense path fails
+         (acceptance criterion A11). Results then carry degraded=True and the reason.
+Scores are cosine similarities (0-1). The two backends score on different scales, so each has
+its own threshold.
+
+The threshold
+-------------
+For each labelled development ticket the top score is compared with whether the top passage
+comes from a document a correct answer should cite (`expected_doc_ids`). The threshold is the
+score that best separates "the best passage is right" from "the best passage is wrong, or the
+intent has no documentation at all" (maximum of true-positive rate minus false-positive rate).
+Tickets labelled unanswerable whose intent does have documentation are left out: the same text
+carries both labels in this data (discovery finding E24). Below the threshold, retrieve returns
+no passages, status "no_relevant_passage", and the router escalates. The closest candidates are
+still recorded in `candidates` for the decision log.
+
+Chunking (chosen by `compare`; see the README/report for the figures)
+--------
+"document": one chunk per article, headed by its title. The articles are short (133-209 words)
+and each answers one problem, so splitting them separated the symptoms a customer describes from
+the fix, which made relevance harder to judge and left answer points out of the top passage.
+Caveat for the dense backend: all-MiniLM-L6-v2 reads about 256 word pieces, so for the 8 longest
+articles the end (mostly Notes) is not embedded. The full text is still stored and returned.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Any, Callable, Iterable, Optional, Sequence
+
+import numpy as np
+from pydantic import BaseModel
+
+from src.ingest import (CHUNK_STRATEGIES, DEFAULT_COLLECTION, DEFAULT_MODEL, DEFAULT_STRATEGY, Chunk,
+                        NormalisedTicket, chroma_client, chunk_corpus, load_tickets, normalise_ticket,
+                        validate_docs)
+
+log = logging.getLogger("retrieve")
+
+DEFAULT_DOCS = "./data/documentation.json"
+DEFAULT_CHROMA = "./storage/chroma"
+DEFAULT_CONFIG = "./storage/retrieval.json"
+DEFAULT_TRAIN = "./data/development_tickets.json"
+DEFAULT_K = 5
+# Used only until `calibrate` has run (and written storage/retrieval.json).
+FALLBACK_THRESHOLDS = {"dense": 0.45, "lexical": 0.20}
+
+
+# ------------------------------------------------------------------ output
+class Passage(BaseModel):
+    rank: int
+    chunk_id: str          # e.g. DOC-AUTH-004::resolution; resolves through Corpus.resolve
+    doc_id: str            # e.g. DOC-AUTH-004; an article in documentation.json
+    title: str
+    section: str
+    score: float
+    text: str
+
+
+class Candidate(BaseModel):
+    chunk_id: str
+    score: float
+    title: str = ""
+
+
+class RetrievalResult(BaseModel):
+    ticket_id: str = ""
+    status: str            # ok | no_relevant_passage | empty_query | unavailable
+    passages: list[Passage] = []        # above threshold, best first; empty means "nothing relevant"
+    candidates: list[Candidate] = []    # best matches regardless of threshold, for the decision log
+    top_score: float = 0.0
+    threshold: float = 0.0
+    backend: str = ""
+    degraded: bool = False              # True when the primary backend failed and lexical answered
+    reason: str = ""
+    latency_ms: float = 0.0
+
+    @property
+    def doc_ids(self) -> list[str]:
+        return list(dict.fromkeys(p.doc_id for p in self.passages))
+
+
+# ------------------------------------------------------------------ the corpus: source of truth for ids
+class Corpus:
+    """Chunks rebuilt from documentation.json. Any id a backend returns is checked here, so a
+    stale or tampered index can never produce a citation that does not exist."""
+
+    def __init__(self, chunks: Sequence[Chunk], strategy: str):
+        self.strategy = strategy
+        self.chunks = list(chunks)
+        self.by_id = {c.chunk_id: c for c in self.chunks}
+        self.doc_ids = {c.doc_id for c in self.chunks}
+
+    @classmethod
+    def from_file(cls, docs_path: Path, strategy: str = DEFAULT_STRATEGY) -> "Corpus":
+        docs, skipped = validate_docs(json.loads(Path(docs_path).read_text(encoding="utf-8")))
+        for s in skipped:
+            log.warning("corpus: skipped %s (%s)", s["doc"], s["reason"])
+        return cls(chunk_corpus(docs, source_file=Path(docs_path).name, strategy=strategy), strategy)
+
+    def resolve(self, chunk_id: str) -> Optional[Chunk]:
+        return self.by_id.get(chunk_id)
+
+    def verify(self, chunk_id: str, text: Optional[str] = None) -> bool:
+        """True if the id exists and, when text is given, the text is exactly that chunk's text."""
+        chunk = self.by_id.get(chunk_id)
+        return chunk is not None and (text is None or text == chunk.text)
+
+
+# ------------------------------------------------------------------ search backends
+Hits = list[tuple[str, float]]  # (chunk_id, score), best first
+
+
+class LexicalSearch:
+    name = "lexical"
+
+    def __init__(self, corpus: Corpus):
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.pipeline import make_union
+        self.ids = [c.chunk_id for c in corpus.chunks]
+        self.vectoriser = make_union(
+            TfidfVectorizer(ngram_range=(1, 2), sublinear_tf=True, stop_words="english"),
+            TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), sublinear_tf=True))
+        self.matrix = self.vectoriser.fit_transform([c.text for c in corpus.chunks])
+
+    def search(self, text: str, k: int) -> Hits:
+        from sklearn.metrics.pairwise import cosine_similarity
+        q = self.vectoriser.transform([text])
+        if q.nnz == 0:
+            return []
+        scores = cosine_similarity(q, self.matrix)[0] / 1.0   # union of two l2-normed parts -> 0..1
+        order = np.argsort(-scores, kind="stable")[:k]
+        return [(self.ids[i], float(scores[i])) for i in order]
+
+
+class InMemoryDenseSearch:
+    """Dense search without Chroma: used by `compare`, and by tests with a fake embedder."""
+    name = "dense"
+
+    def __init__(self, corpus: Corpus, embed: Callable[[Sequence[str]], list[list[float]]]):
+        self.ids = [c.chunk_id for c in corpus.chunks]
+        self.embed = embed
+        m = np.asarray(embed([c.text for c in corpus.chunks]), dtype=float)
+        self.matrix = m / np.clip(np.linalg.norm(m, axis=1, keepdims=True), 1e-12, None)
+
+    def search(self, text: str, k: int) -> Hits:
+        q = np.asarray(self.embed([text])[0], dtype=float)
+        q = q / max(np.linalg.norm(q), 1e-12)
+        scores = self.matrix @ q
+        order = np.argsort(-scores, kind="stable")[:k]
+        return [(self.ids[i], float(scores[i])) for i in order]
+
+
+class ChromaSearch:
+    """The production dense path: the collection written by `python -m src.ingest docs`."""
+    name = "dense"
+
+    def __init__(self, persist_dir: Path, collection: str, embed: Callable[[Sequence[str]], list[list[float]]]):
+        self.collection = chroma_client(persist_dir).get_collection(collection)
+        if self.collection.count() == 0:
+            raise RuntimeError(f"collection {collection!r} in {persist_dir} is empty")
+        self.embed = embed
+
+    def search(self, text: str, k: int) -> Hits:
+        res = self.collection.query(query_embeddings=self.embed([text]), n_results=k, include=["distances"])
+        return [(cid, float(1.0 - d)) for cid, d in zip(res["ids"][0], res["distances"][0])]
+
+
+# ------------------------------------------------------------------ the retriever
+class Retriever:
+    def __init__(self, corpus: Corpus, primary: Any = None, fallback: Optional[LexicalSearch] = None,
+                 thresholds: Optional[dict] = None, k: int = DEFAULT_K, primary_error: str = ""):
+        self.corpus = corpus
+        self.primary = primary
+        self.fallback = fallback if fallback is not None else LexicalSearch(corpus)
+        self.thresholds = {**FALLBACK_THRESHOLDS, **(thresholds or {})}
+        self.k = k
+        self.primary_error = primary_error
+
+    def retrieve(self, ticket: Any, k: Optional[int] = None) -> RetrievalResult:
+        """Never raises. Returns passages above the threshold, best first, or none."""
+        started = time.perf_counter()
+        k = k or self.k
+        ticket_id, text = _query_of(ticket)
+        result = self._retrieve(ticket_id, text, k)
+        result.latency_ms = round((time.perf_counter() - started) * 1000, 2)
+        return result
+
+    def _retrieve(self, ticket_id: str, text: str, k: int) -> RetrievalResult:
+        if not text.strip():
+            return RetrievalResult(ticket_id=ticket_id, status="empty_query", reason="ticket has no usable text")
+        backend, degraded, reason = self.primary, False, ""
+        if backend is None:
+            backend, degraded = self.fallback, True
+            reason = self.primary_error or "no dense index configured; lexical search used"
+        hits: Hits = []
+        try:
+            hits = backend.search(text, max(k, DEFAULT_K))
+        except Exception as exc:
+            log.warning("%s search failed (%s); using lexical fallback", backend.name, exc)
+            backend, degraded, reason = self.fallback, True, f"{backend.name} failed: {type(exc).__name__}: {exc}"
+            try:
+                hits = backend.search(text, max(k, DEFAULT_K))
+            except Exception as exc2:  # nothing left to try
+                return RetrievalResult(ticket_id=ticket_id, status="unavailable", degraded=True,
+                                       reason=f"{reason}; lexical failed: {exc2}")
+
+        verified = [(cid, s) for cid, s in hits if self.corpus.resolve(cid) is not None]
+        if len(verified) < len(hits):
+            reason = (reason + "; " if reason else "") + f"{len(hits) - len(verified)} unresolvable id(s) dropped"
+        threshold = float(self.thresholds.get(backend.name, FALLBACK_THRESHOLDS[backend.name]))
+        top = verified[0][1] if verified else 0.0
+        passages = []
+        for cid, score in verified:
+            if score < threshold or len(passages) >= k:
+                break
+            c = self.corpus.resolve(cid)
+            passages.append(Passage(rank=len(passages) + 1, chunk_id=cid, doc_id=c.doc_id,
+                                    title=c.metadata.get("title", ""), section=c.section,
+                                    score=round(score, 4), text=c.text))
+        status = "ok" if passages else "no_relevant_passage"
+        if not passages:
+            reason = (reason + "; " if reason else "") + (
+                f"best match {verified[0][0]} scored {top:.3f}, below the {threshold:.3f} threshold"
+                if verified else "no match at all")
+        return RetrievalResult(
+            ticket_id=ticket_id, status=status, passages=passages,
+            candidates=[Candidate(chunk_id=c, score=round(s, 4),
+                                  title=self.corpus.resolve(c).metadata.get("title", ""))
+                        for c, s in verified[:max(k, DEFAULT_K)]],
+            top_score=round(top, 4), threshold=round(threshold, 4), backend=backend.name,
+            degraded=degraded, reason=reason)
+
+
+def _query_of(ticket: Any) -> tuple[str, str]:
+    if isinstance(ticket, str):
+        return "", ticket
+    t = ticket if isinstance(ticket, NormalisedTicket) else normalise_ticket(ticket)
+    return t.ticket_id, t.text if t.processable else ""
+
+
+# ------------------------------------------------------------------ measurement
+def _labelled(tickets: Iterable[Any]) -> list[NormalisedTicket]:
+    rows = [t if isinstance(t, NormalisedTicket) else normalise_ticket(t) for t in tickets]
+    return [t for t in rows if t.processable and t.eval_labels is not None]
+
+
+def no_doc_intents(tickets: Sequence[NormalisedTicket]) -> set[str]:
+    """Intents for which no ticket ever has an expected document (here: feature_request and
+    unclear_request). Tickets of these intents are truly unanswerable from the docs."""
+    has_doc: dict[str, bool] = {}
+    for t in tickets:
+        intent = t.eval_labels.get("intent", "")
+        has_doc[intent] = has_doc.get(intent, False) or bool(t.eval_labels.get("expected_doc_ids"))
+    return {i for i, h in has_doc.items() if not h}
+
+
+def score_tickets(search: Any, corpus: Corpus, tickets: Sequence[NormalisedTicket], k: int = DEFAULT_K,
+                  no_doc: Optional[set[str]] = None) -> list[dict]:
+    """Per ticket: top score, rank of the first correct document, and which group it falls in:
+
+    relevant   the top passage comes from an expected document
+    wrong      the ticket has expected documents, but the top passage is from another one
+    no_doc     the ticket's intent never has documentation: any passage is irrelevant
+    ambiguous  labelled not answerable although its intent has documentation. Identical ticket
+               text carries both labels in this data (discovery finding E24), so these tickets
+               say nothing reliable about relevance and are left out of threshold fitting.
+    """
+    no_doc = no_doc_intents(tickets) if no_doc is None else no_doc
+    out = []
+    for t in tickets:
+        expected = set(t.eval_labels.get("expected_doc_ids") or [])
+        hits = [(cid, s) for cid, s in search.search(t.text, k) if corpus.resolve(cid)]
+        docs = [corpus.resolve(cid).doc_id for cid, _ in hits]
+        first = next((i + 1 for i, d in enumerate(docs) if d in expected), None)
+        top_correct = bool(docs) and docs[0] in expected
+        if expected:
+            group = "relevant" if top_correct else "wrong"
+        else:
+            group = "no_doc" if t.eval_labels.get("intent") in no_doc else "ambiguous"
+        out.append({"ticket_id": t.ticket_id, "top_score": hits[0][1] if hits else 0.0,
+                    "top_correct": top_correct, "first_correct_rank": first, "group": group,
+                    "top_text": corpus.resolve(hits[0][0]).text if hits else "",
+                    "top3_text": " ".join(corpus.resolve(c).text for c, _ in hits[:3]),
+                    "answerable": bool(expected)})
+    return out
+
+
+def _fit_rows(rows: Sequence[dict]) -> list[dict]:
+    return [r for r in rows if r["group"] != "ambiguous"]
+
+
+def best_threshold(rows: Sequence[dict]) -> float:
+    """Score that best separates 'top passage is right' from 'top passage is wrong or there is
+    nothing to find' (max TPR - FPR), ignoring ambiguous tickets."""
+    rows = _fit_rows(rows)
+    scores = np.array([r["top_score"] for r in rows])
+    good = np.array([r["top_correct"] for r in rows])
+    if len(rows) == 0:
+        return 0.0
+    if good.all() or (~good).all():
+        return float(np.median(scores))
+    best, best_j = 0.0, -1.0
+    for th in np.unique(scores):
+        j = (scores[good] >= th).mean() - (scores[~good] >= th).mean()
+        if j > best_j:
+            best, best_j = float(th), j
+    return best
+
+
+def metrics(rows: Sequence[dict], threshold: float, truth: Optional[dict] = None) -> dict:
+    ans = [r for r in rows if r["answerable"]]
+    nodoc = [r for r in rows if r["group"] == "no_doc"]
+    fit = _fit_rows(rows)
+    scores = np.array([r["top_score"] for r in fit])
+    good = np.array([r["top_correct"] for r in fit])
+    auc = None
+    if good.any() and (~good).any():
+        pos, neg = scores[good], scores[~good]
+        auc = float(((pos[:, None] > neg[None, :]).mean() + 0.5 * (pos[:, None] == neg[None, :]).mean()))
+    ranks = [r["first_correct_rank"] for r in ans]
+    returned = [r for r in fit if r["top_score"] >= threshold]
+    out = {
+        "tickets": len(rows), "answerable": len(ans), "no_doc": len(nodoc),
+        "ambiguous_excluded": len(rows) - len(fit),
+        "hit_at_1": round(np.mean([x == 1 for x in ranks]), 3) if ans else None,
+        "hit_at_3": round(np.mean([x is not None and x <= 3 for x in ranks]), 3) if ans else None,
+        "mrr": round(np.mean([1 / x if x else 0 for x in ranks]), 3) if ans else None,
+        "separation_auc": round(auc, 3) if auc is not None else None,
+        "threshold": round(threshold, 4),
+        # with the threshold applied
+        "retrieval_hit_rate": round(np.mean([r["top_score"] >= threshold and r["top_correct"] for r in ans]), 3)
+        if ans else None,
+        "returned_for_no_doc": round(np.mean([r["top_score"] >= threshold for r in nodoc]), 3) if nodoc else None,
+        "precision_when_returned": round(np.mean([r["top_correct"] for r in returned]), 3) if returned else None,
+    }
+    if truth:  # share of the senior agents' must_mention points found in the passages
+        cov1, cov3 = [], []
+        for r in rows:
+            mm = [m.lower() for m in (truth.get(r["ticket_id"], {}).get("must_mention") or [])]
+            if mm:
+                cov1.append(np.mean([m in r["top_text"].lower() for m in mm]))
+                cov3.append(np.mean([m in r["top3_text"].lower() for m in mm]))
+        out["must_mention_in_top1"] = round(float(np.mean(cov1)), 3) if cov1 else None
+        out["must_mention_in_top3"] = round(float(np.mean(cov3)), 3) if cov3 else None
+        out["must_mention_tickets"] = len(cov1)
+    return out
+
+
+def cross_fitted_metrics(rows: Sequence[dict], folds: int = 5) -> dict:
+    """Threshold chosen on 4/5 of the tickets and applied to the other 1/5, so the thresholded
+    figures are not flattered by choosing and scoring on the same tickets."""
+    rows = _fit_rows(rows)
+    idx = np.arange(len(rows))
+    np.random.default_rng(0).shuffle(idx)
+    applied = []
+    for f in range(folds):
+        test = set(idx[f::folds].tolist())
+        th = best_threshold([rows[i] for i in idx if i not in test])
+        applied += [(rows[i]["top_score"] >= th, rows[i]["top_correct"]) for i in test]
+    ret = np.array([a for a, _ in applied], dtype=bool)
+    good = np.array([g for _, g in applied], dtype=bool)
+    if not good.any() or good.all():
+        return {"cv_tpr": None, "cv_fpr": None, "cv_j": None}
+    return {"cv_tpr": round(float(ret[good].mean()), 3), "cv_fpr": round(float(ret[~good].mean()), 3),
+            "cv_j": round(float(ret[good].mean() - ret[~good].mean()), 3)}
+
+
+def compare_strategies(docs_path: Path, train: Sequence[NormalisedTicket], backend: str,
+                       embed: Optional[Callable] = None, validation: Optional[Sequence[NormalisedTicket]] = None,
+                       strategies: Sequence[str] = CHUNK_STRATEGIES, truth: Optional[dict] = None) -> dict:
+    results = {}
+    no_doc = no_doc_intents(train)
+    for strategy in strategies:
+        corpus = Corpus.from_file(docs_path, strategy)
+        search = LexicalSearch(corpus) if backend == "lexical" else InMemoryDenseSearch(corpus, embed)
+        rows = score_tickets(search, corpus, train, no_doc=no_doc)
+        th = best_threshold(rows)
+        entry = {"chunks": len(corpus.chunks),
+                 "mean_words": round(float(np.mean([len(c.text.split()) for c in corpus.chunks])), 1),
+                 "development": {**metrics(rows, th, truth), **cross_fitted_metrics(rows)}}
+        if validation:
+            entry["validation"] = metrics(score_tickets(search, corpus, validation, no_doc=no_doc), th, truth)
+        results[strategy] = entry
+
+    def key(s):
+        d = results[s]["development"]
+        return (round(d["cv_j"] or 0, 2), d.get("must_mention_in_top1") or 0, d["mrr"] or 0)
+    ranked = sorted(results, key=key, reverse=True)
+    return {"backend": backend,
+            "ranked_by": "cross-fitted J (right passage returned minus irrelevant returned), "
+                         "then must_mention coverage of the top passage, then MRR",
+            "recommended": ranked[0], "results": results}
+
+
+# ------------------------------------------------------------------ building the retriever
+def _embedder(model: str):
+    from src.ingest import SentenceTransformerEmbedder
+    return SentenceTransformerEmbedder(model).embed
+
+
+def build_retriever(docs_path: Optional[Path] = None, persist_dir: Optional[Path] = None,
+                    config_path: Optional[Path] = None, backend: Optional[str] = None,
+                    embed: Optional[Callable] = None) -> Retriever:
+    """Assemble the production retriever. Always returns something usable: if the dense path
+    cannot be built, the retriever runs on lexical search and says so in every result."""
+    docs_path = Path(docs_path or os.getenv("DOCS_PATH", DEFAULT_DOCS))
+    persist_dir = Path(persist_dir or os.getenv("CHROMA_PATH", DEFAULT_CHROMA))
+    config_path = Path(config_path or os.getenv("RETRIEVAL_CONFIG", DEFAULT_CONFIG))
+    backend = backend or os.getenv("RETRIEVAL_BACKEND", "dense")
+    config = _read_json(config_path)
+    report = _read_json(persist_dir / "ingest_report.json")
+    strategy = report.get("strategy") or config.get("strategy") or os.getenv("CHUNK_STRATEGY", DEFAULT_STRATEGY)
+    corpus = Corpus.from_file(docs_path, strategy)
+
+    primary, error = None, ""
+    if backend == "dense":
+        try:
+            embed = embed or _embedder(report.get("embedding_model") or os.getenv("EMBEDDING_MODEL", DEFAULT_MODEL))
+            primary = ChromaSearch(persist_dir, os.getenv("CHROMA_COLLECTION", DEFAULT_COLLECTION), embed)
+        except Exception as exc:
+            error = f"dense unavailable: {type(exc).__name__}: {exc}"
+            log.warning("%s; retrieval will use lexical search", error)
+    retriever = Retriever(corpus, primary=primary, thresholds=config.get("thresholds"), primary_error=error)
+    if not config.get("thresholds"):
+        log.warning("no %s yet: using default thresholds; run `python -m src.retrieve calibrate`", config_path)
+    return retriever
+
+
+def calibrate(retriever: Retriever, tickets: Sequence[NormalisedTicket], config_path: Path) -> dict:
+    """Choose a threshold per available backend from labelled tickets and save it."""
+    out = {"strategy": retriever.corpus.strategy, "calibrated_on": len(tickets), "thresholds": {}, "metrics": {}}
+    backends = [b for b in (retriever.primary, retriever.fallback) if b is not None]
+    for b in backends:
+        rows = score_tickets(b, retriever.corpus, tickets)
+        th = best_threshold(rows)
+        out.setdefault("ambiguous_excluded", sum(r["group"] == "ambiguous" for r in rows))
+        out["thresholds"][b.name] = round(th, 4)
+        out["metrics"][b.name] = {**metrics(rows, th), **cross_fitted_metrics(rows)}
+    retriever.thresholds.update(out["thresholds"])
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(out, indent=2))
+    return out
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+# ------------------------------------------------------------------ command line
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
+    p = argparse.ArgumentParser(prog="python -m src.retrieve", description="Search the documentation.")
+    p.add_argument("--docs", type=Path, default=Path(os.getenv("DOCS_PATH", DEFAULT_DOCS)))
+    p.add_argument("--config", type=Path, default=Path(os.getenv("RETRIEVAL_CONFIG", DEFAULT_CONFIG)))
+    p.add_argument("--backend", choices=["dense", "lexical"], default=os.getenv("RETRIEVAL_BACKEND", "dense"))
+    sub = p.add_subparsers(dest="command", required=True)
+    s = sub.add_parser("search", help="search for one query")
+    s.add_argument("query")
+    s.add_argument("-k", type=int, default=DEFAULT_K)
+    c = sub.add_parser("calibrate", help="set thresholds from labelled tickets")
+    c.add_argument("--tickets", type=Path, default=Path(os.getenv("TRAIN_DATA", DEFAULT_TRAIN)))
+    e = sub.add_parser("evaluate", help="hit rate and threshold behaviour on labelled tickets")
+    e.add_argument("--tickets", type=Path, required=True)
+    cmp = sub.add_parser("compare", help="compare chunking strategies")
+    cmp.add_argument("--tickets", type=Path, default=Path(os.getenv("TRAIN_DATA", DEFAULT_TRAIN)))
+    cmp.add_argument("--validation", type=Path, default=Path("./data/validation_tickets.json"))
+    cmp.add_argument("--truth", type=Path, default=Path("./data/ground_truth_responses.json"))
+    cmp.add_argument("--output", type=Path, default=Path("./storage/chunking_comparison.json"))
+    args = p.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+
+    try:
+        if args.command == "compare":
+            embed = _embedder(os.getenv("EMBEDDING_MODEL", DEFAULT_MODEL)) if args.backend == "dense" else None
+            val = _labelled(load_tickets(args.validation)) if args.validation.is_file() else None
+            truth = {g["ticket_id"]: g for g in json.loads(args.truth.read_text())} if args.truth.is_file() else None
+            report = compare_strategies(args.docs, _labelled(load_tickets(args.tickets)), args.backend, embed, val,
+                                        truth=truth)
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(json.dumps(report, indent=2))
+            _print_comparison(report)
+            return 0
+        retriever = build_retriever(args.docs, config_path=args.config, backend=args.backend)
+        if args.command == "search":
+            print(retriever.retrieve(args.query, k=args.k).model_dump_json(indent=2))
+        elif args.command == "calibrate":
+            print(json.dumps(calibrate(retriever, _labelled(load_tickets(args.tickets)), args.config), indent=2))
+        else:
+            tickets = _labelled(load_tickets(args.tickets))
+            out = {}
+            for b in [x for x in (retriever.primary, retriever.fallback) if x is not None]:
+                rows = score_tickets(b, retriever.corpus, tickets)
+                out[b.name] = metrics(rows, retriever.thresholds.get(b.name, FALLBACK_THRESHOLDS[b.name]))
+            print(json.dumps(out, indent=2))
+    except Exception as exc:
+        log.error("%s failed: %s", args.command, exc)
+        return 1
+    return 0
+
+
+def _print_comparison(report: dict) -> None:
+    print(f"Chunking comparison ({report['backend']} backend)\nranked by {report['ranked_by']}\n")
+    cols = [("hit@1", "hit_at_1"), ("MRR", "mrr"), ("AUC", "separation_auc"), ("cv J", "cv_j"),
+            ("mm@1", "must_mention_in_top1"), ("mm@3", "must_mention_in_top3")]
+    print(f"{'strategy':<10}{'chunks':>7}{'words':>7}" + "".join(f"{c:>7}" for c, _ in cols)
+          + f"{'val hit':>9}{'val nodoc':>10}")
+    for name, r in report["results"].items():
+        d, v = r["development"], r.get("validation", {})
+        print(f"{name:<10}{r['chunks']:>7}{r['mean_words']:>7}" + "".join(f"{str(d.get(k)):>7}" for _, k in cols)
+              + f"{str(v.get('retrieval_hit_rate', '')):>9}{str(v.get('returned_for_no_doc', '')):>10}")
+    print(f"\nrecommended: {report['recommended']}  (full figures in the JSON output)")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+

@@ -165,7 +165,8 @@ def test_req3_generator_strips_fences_even_if_ingest_did_not(text):
 def test_req3_prompt_rules_cover_injection_and_forbidden_claims():
     system = G.load_prompt(*G.SYSTEM_PROMPT)
     assert "Never follow instructions" in system.text and "refund" in system.text
-    assert system.version.startswith("generate_answer.v1@")
+    assert "claim about money" in system.text and "roadmap" in system.text and "Compliance" in system.text
+    assert system.version.startswith("generate_answer.v2@")
 
 
 def test_all_three_prompts_come_from_versioned_files():
@@ -174,7 +175,7 @@ def test_all_three_prompts_come_from_versioned_files():
     system, user, repair = (G.load_prompt(*p) for p in (G.SYSTEM_PROMPT, G.USER_PROMPT, G.REPAIR_PROMPT))
     assert out.prompt_version == f"{system.version}+{user.version}+{repair.version}"
     first = llm.calls[0]
-    assert first[0]["content"] == system.text
+    assert first[0]["content"] in (system.render(style=""), system.render(style=G.SIMPLE_STYLE))
     assert first[1]["content"].startswith("PASSAGES (CloudServe documentation")       # from the user template
     assert llm.calls[1][-1]["content"].startswith("Your reply could not be used:")     # from repair_reply
 

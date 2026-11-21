@@ -36,6 +36,17 @@ the ticket that looks like one of these tags is replaced before sending, so a cu
 close the data block and write their own instructions. The customer's name, id, tier and region
 are never sent to the model: it does not need them.
 
+Personal data in the ticket (emails, customer ids, keys, phone and card numbers) is masked before
+the text is sent to any model, so it never leaves CloudServe in a prompt. Customers in a region
+listed in LLM_BLOCKED_REGIONS (for example LLM_BLOCKED_REGIONS=europe, to keep their ticket text
+inside CloudServe for data-residency reasons) get the extractive reply: no model is called for them.
+
+Languages: a ticket not written in English is translated into English first (translate_ticket);
+the reply is drafted and verified in English, then translated into the customer's language
+(translate_reply) and sent with the English version below it, so the cited, checked wording is
+always there. Customers writing in a second language get a style instruction for short, plain
+sentences.
+
 The reply shown to the customer is assembled by code from the validated claims: a fixed opening,
 the claims with numbered citation markers, a fixed closing and a numbered source list. The model
 cannot add text outside a cited claim.
@@ -57,7 +68,8 @@ from typing import Any, Callable, Optional, Protocol, Sequence
 
 from pydantic import BaseModel, ValidationError, field_validator
 
-from src.ingest import NormalisedTicket, normalise_ticket
+from src.ingest import LANGUAGE_NAMES, NormalisedTicket, normalise_ticket
+from src.logging_store import mask_pii
 from src.retrieve import Passage, RetrievalResult
 
 log = logging.getLogger("generate")
@@ -80,9 +92,15 @@ _FENCE = re.compile(r"<\s*/?\s*(customer_ticket|passages?|system|instructions)\b
 # judge output), named <name>.v<N>.txt. Each caller pins the version it loads; PROMPT_<NAME>=vN in
 # the environment selects another version for a trial run without a code change.
 PROMPTS_DIR = Path(__file__).resolve().parents[1] / "prompts"
-SYSTEM_PROMPT = ("generate_answer", 1)        # prompts/build/generate_answer.v1.txt
+SYSTEM_PROMPT = ("generate_answer", 2)        # prompts/build/generate_answer.v2.txt
 USER_PROMPT = ("generate_answer_user", 1)     # prompts/build/generate_answer_user.v1.txt
 REPAIR_PROMPT = ("repair_reply", 1)           # prompts/build/repair_reply.v1.txt
+TRANSLATE_TICKET = ("translate_ticket", 1)            # prompts/build/translate_ticket.v1.txt
+TRANSLATE_TICKET_USER = ("translate_ticket_user", 1)  # prompts/build/translate_ticket_user.v1.txt
+TRANSLATE_REPLY = ("translate_reply", 1)              # prompts/build/translate_reply.v1.txt
+TRANSLATE_REPLY_USER = ("translate_reply_user", 1)    # prompts/build/translate_reply_user.v1.txt
+SIMPLE_STYLE = ("The customer is not writing in their first language: use short, simple sentences and "
+                "common words, and avoid idioms.")
 
 
 class PromptError(RuntimeError):
@@ -154,6 +172,11 @@ class GeneratedAnswer(BaseModel):
     degraded: bool = False
     error: str = ""
     raw_output: str = ""              # the model's last raw reply, for the decision log
+    purpose: str = "reply"            # "reply" (may be sent) | "agent_draft" (for a person to review)
+    reply_language: str = "en"        # language of answer_text's main part
+    answer_text_en: str = ""          # the English reply the guardrails verify (= answer_text if English)
+    translation_error: str = ""       # why a reply could not be translated, if it could not
+    data_policy: str = ""             # e.g. why no external model was used for this customer
     latency_ms: float = 0.0
 
 
@@ -296,8 +319,8 @@ def build_messages(system_prompt: str, ticket: NormalisedTicket, passages: Seque
     user_template = user_template or load_prompt(*USER_PROMPT)
     labels = {f"P{i + 1}": p for i, p in enumerate(passages[:MAX_PASSAGES])}
     blocks = [f'<passage id="{label}" title="{p.title}">\n{p.text}\n</passage>' for label, p in labels.items()]
-    subject, _ = sanitise_ticket_text(ticket.subject)
-    body, _ = sanitise_ticket_text(ticket.body or ticket.text)
+    subject, _ = sanitise_ticket_text(mask_pii(ticket.subject))
+    body, _ = sanitise_ticket_text(mask_pii(ticket.body or ticket.text))
     ticket_block = (f"Subject: {subject}\n" if subject else "") + f"Message: {body}"
     user = user_template.render(passages="\n\n".join(blocks), ticket=ticket_block)
     return [{"role": "system", "content": system_prompt}, {"role": "user", "content": user}], labels
@@ -396,23 +419,89 @@ class Generator:
             self.repair = load_prompt(*REPAIR_PROMPT, root=prompts_dir)
             self.system_prompt = self.system.text
             self.prompt_version = "+".join(p.version for p in (self.system, self.user_template, self.repair))
+            self.translate_prompts = {k: load_prompt(*v, root=prompts_dir) for k, v in (
+                ("ticket", TRANSLATE_TICKET), ("ticket_user", TRANSLATE_TICKET_USER),
+                ("reply", TRANSLATE_REPLY), ("reply_user", TRANSLATE_REPLY_USER))}
         except PromptError as exc:
             self.system = self.user_template = self.repair = None
+            self.translate_prompts = {}
             self.system_prompt, self.prompt_version = "", ""
             self.client = None
             self.unavailable_reason = f"prompt file missing: {exc}"
 
-    def generate(self, ticket: Any, retrieval: RetrievalResult) -> GeneratedAnswer:
-        """Never raises."""
+    def generate(self, ticket: Any, retrieval: RetrievalResult, purpose: str = "reply") -> GeneratedAnswer:
+        """Never raises. purpose="agent_draft" drafts a reply for a person to review and send."""
         started = time.perf_counter()
         t = ticket if isinstance(ticket, NormalisedTicket) else normalise_ticket(ticket)
         try:
             out = self._generate(t, retrieval)
+            if out.status == "answered":
+                self._localise(t, out)
         except Exception as exc:  # last line of defence
             log.exception("generation failed for %s", t.ticket_id)
             out = self._dont_know(t, generator="none", error=f"{type(exc).__name__}: {exc}", status="failed")
+        out.purpose = purpose
+        if not out.answer_text_en:
+            out.answer_text_en = out.answer_text
         out.latency_ms = round((time.perf_counter() - started) * 1000, 2)
         return out
+
+    # ---------------- data policy and languages
+    @staticmethod
+    def blocked_region(t: NormalisedTicket) -> str:
+        """Non-empty (the reason) when this customer's text must not be sent to an external model."""
+        blocked = {r.strip().lower() for r in os.getenv("LLM_BLOCKED_REGIONS", "").split(",") if r.strip()}
+        region = t.customer_region.value
+        if region in blocked:
+            return (f"data residency policy: ticket text from {region} customers is not sent to an external "
+                    f"model (LLM_BLOCKED_REGIONS)")
+        return ""
+
+    def can_translate(self, t: NormalisedTicket) -> str:
+        """'' if translation is possible for this ticket, else the reason it is not."""
+        if self.client is None:
+            return self.unavailable_reason or "no model configured"
+        if not self.translate_prompts:
+            return "translation prompts missing"
+        return self.blocked_region(t)
+
+    def translate_ticket(self, t: NormalisedTicket) -> tuple[Optional[str], str]:
+        """(English text, '') or (None, reason). Personal data is masked before sending."""
+        reason = self.can_translate(t)
+        if reason:
+            return None, reason
+        text, _ = sanitise_ticket_text(mask_pii(t.original_text or t.text))
+        messages = [{"role": "system", "content": self.translate_prompts["ticket"].text},
+                    {"role": "user", "content": self.translate_prompts["ticket_user"].render(
+                        language=LANGUAGE_NAMES.get(t.language, t.language), ticket=text)}]
+        try:
+            out = self.client.complete(messages, max_tokens=800).strip()
+        except Exception as exc:
+            return None, f"translation failed: {exc}"
+        return (out, "") if out else (None, "translation was empty")
+
+    def _localise(self, t: NormalisedTicket, a: GeneratedAnswer) -> None:
+        """Translate an answered reply into the customer's language, keeping the English below."""
+        a.answer_text_en = a.answer_text
+        if t.language in ("en", "und"):
+            return
+        reason = self.can_translate(t)
+        if reason:
+            a.translation_error = reason
+            return
+        messages = [{"role": "system", "content": self.translate_prompts["reply"].render(
+                        language=LANGUAGE_NAMES.get(t.language, t.language))},
+                    {"role": "user", "content": self.translate_prompts["reply_user"].render(reply=a.answer_text)}]
+        try:
+            local = self.client.complete(messages, max_tokens=1000).strip()
+        except Exception as exc:
+            a.translation_error = f"translation failed: {exc}"
+            return
+        if not local:
+            a.translation_error = "translation was empty"
+            return
+        a.reply_language = t.language
+        a.answer_text = f"{local}\n\n---\nEnglish version:\n{a.answer_text_en}"
 
     def _generate(self, t: NormalisedTicket, r: RetrievalResult) -> GeneratedAnswer:
         passages = list(r.passages[:MAX_PASSAGES])
@@ -420,8 +509,15 @@ class Generator:
             return self._dont_know(t, generator="none", missing="No documentation passage matched this ticket.")
         if self.client is None:
             return self._extractive(t, passages, self.unavailable_reason or "no model client configured")
+        policy = self.blocked_region(t)
+        if policy:
+            out = self._extractive(t, passages, policy)
+            out.degraded, out.data_policy = False, policy      # a policy choice, not a failure
+            return out
 
-        messages, labels = build_messages(self.system_prompt, t, passages, self.user_template)
+        style = SIMPLE_STYLE if (t.language_fluency.value == "non_fluent" or t.translated) else ""
+        system = self.system.render(style=style) if "style" in self.system.placeholders else self.system_prompt
+        messages, labels = build_messages(system, t, passages, self.user_template)
         raw, last_error = "", ""
         for attempt in range(1, MAX_ATTEMPTS + 1):
             try:

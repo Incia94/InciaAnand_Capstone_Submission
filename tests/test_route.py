@@ -152,8 +152,8 @@ def test_req3_reasons_are_plain_language(decisions):
 
 def test_req3_every_check_explained(decisions):
     for d in decisions:
-        assert [c.name for c in d.checks] == ["readable", "classified", "policy", "documentation",
-                                              "confidence", "consistency"]
+        assert [c.name for c in d.checks] == ["readable", "language", "classified", "policy", "topic",
+                                              "documentation", "confidence", "consistency"]
         for c in d.checks:
             assert c.detail and c.detail.endswith(".") and "_" not in c.detail
 

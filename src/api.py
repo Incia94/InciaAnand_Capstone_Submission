@@ -67,6 +67,8 @@ class TicketOutcome(BaseModel):
     confidence: float = 0.0
     sources: list[dict] = []             # citations of a sent reply, or what the agent should look at
     handoff: Optional[dict] = None       # for escalations: summary, sources, uncertainties, priority, team
+    draft_reply: Optional[dict] = None   # for escalations: a cited draft the agent can review, edit and send
+    language: str = "en"                 # the language the customer wrote in
     guardrail: Optional[dict] = None     # what the guardrails checked and found, if a reply was drafted
     degraded: list[str] = []             # components that ran in backup mode for this ticket
     run_id: Optional[str] = None
@@ -122,13 +124,15 @@ class SupportPipeline:
     r"""The ticket pipeline as a LangGraph state graph.
 
         START -> ingest --(kill switch on)--> kill_switch ------------------------------\
-                        \-> classify -> retrieve -> route --(escalate)--> escalate ------> finish -> END
+                        \-> translate -> classify -> retrieve -> route --(escalate)--> escalate -> finish -> END
                                                         \--(auto_respond)--> generate     /
                                          generate --(no answer in the sources)--> escalate
                                          generate --(answered)--> guardrail --(blocked)--> escalate
                                                                         \--(released)--> send ---/
         any node --(unexpected error)--> error -> finish
 
+    translate turns a non-English ticket into English for the steps after it (the original is kept);
+    escalate attaches a cited draft reply for the agent whenever any documentation was found.
     Every arrow out of a node is a conditional edge whose condition is one function below
     (_after_ingest, _after_route, ...), so each routing decision is explicit, logged and testable.
     `python -m src.api graph` prints the compiled graph as a Mermaid diagram.
@@ -155,14 +159,16 @@ class SupportPipeline:
     def _build_graph(self):
         from langgraph.graph import END, START, StateGraph
         g = StateGraph(PipelineState)
-        for name, fn in (("ingest", self._ingest), ("classify", self._classify), ("retrieve", self._retrieve),
+        for name, fn in (("ingest", self._ingest), ("translate", self._translate), ("classify", self._classify),
+                         ("retrieve", self._retrieve),
                          ("route", self._route), ("generate", self._generate), ("guardrail", self._guardrail),
                          ("send", self._send), ("escalate", self._escalate), ("kill_switch", self._kill_switch),
                          ("error", self._error), ("finish", self._finish)):
             g.add_node(name, self._safe(name, fn) if name not in ("error", "finish") else fn)
         g.add_edge(START, "ingest")
         g.add_conditional_edges("ingest", self._after_ingest,
-                                {"kill_switch": "kill_switch", "classify": "classify", "error": "error"})
+                                {"kill_switch": "kill_switch", "translate": "translate", "error": "error"})
+        g.add_conditional_edges("translate", self._unless_error("classify"), {"classify": "classify", "error": "error"})
         g.add_conditional_edges("classify", self._unless_error("retrieve"), {"retrieve": "retrieve", "error": "error"})
         g.add_conditional_edges("retrieve", self._unless_error("route"), {"route": "route", "error": "error"})
         g.add_conditional_edges("route", self._after_route,
@@ -200,7 +206,7 @@ class SupportPipeline:
     def _after_ingest(state: PipelineState) -> str:
         if state.get("error"):
             return "error"
-        return "kill_switch" if kill_switch_active() else "classify"
+        return "kill_switch" if kill_switch_active() else "translate"
 
     @staticmethod
     def _after_route(state: PipelineState) -> str:
@@ -226,6 +232,26 @@ class SupportPipeline:
         self.store.log_ingest(t, state.get("run_id"))
         return {"ticket": t, "degraded": []}
 
+    def _translate(self, state: PipelineState) -> dict:
+        """Non-English tickets: translate into English for classification, search and drafting.
+        The customer's own words stay in original_* and original_text. If translation is not
+        possible, the ticket goes on untranslated and routing escalates it to a person who reads it."""
+        t = state["ticket"]
+        if t.language in ("en", "und") or not t.processable:
+            return {}
+        english, reason = self.generator.translate_ticket(t)
+        if english is None:
+            self.store.record(t.ticket_id, "translate", "not_translated",
+                              f"Written in {t.language}; could not translate ({reason}).",
+                              prediction=t.language, run_id=state.get("run_id"), input_text=t.text)
+            return {"degraded": state.get("degraded", []) + [f"translation: {reason}"]}
+        t = t.model_copy(update={"subject": "", "body": english, "text": english, "translated": True,
+                                 "word_count": len(english.split())})
+        self.store.record(t.ticket_id, "translate", "translated", f"Translated from {t.language} into English.",
+                          prediction=t.language, run_id=state.get("run_id"), input_text=english,
+                          prompt_version=self.generator.translate_prompts["ticket"].version)
+        return {"ticket": t}
+
     def _classify(self, state: PipelineState) -> dict:
         t = state["ticket"]
         c = self.classifier.classify(t)
@@ -235,8 +261,9 @@ class SupportPipeline:
         return {"classification": c}
 
     def _retrieve(self, state: PipelineState) -> dict:
+        from src.route import hint_docs_for
         t = state["ticket"]
-        r = self.retriever.retrieve(t)
+        r = self.retriever.retrieve(t, hint_docs=hint_docs_for(self.router.config, state["classification"]))
         self.store.log_retrieve(r, t.text, state.get("run_id"))
         degraded = state.get("degraded", []) + ([f"retrieval: {r.reason}"] if r.degraded else [])
         return {"retrieval": r, "degraded": degraded}
@@ -287,17 +314,60 @@ class SupportPipeline:
         return {"outcome": TicketOutcome(
             ticket_id=t.ticket_id, channel=t.channel.value, outcome="sent", reply=out.text, reason=d.reason,
             decided_by=d.decided_by, intent=c.intent, urgency=c.urgency, confidence=c.intent_confidence,
-            sources=[s.model_dump() for s in a.sources], guardrail=out.guardrail.model_dump(mode="json"))}
+            sources=[s.model_dump() for s in a.sources], guardrail=out.guardrail.model_dump(mode="json"),
+            language=t.language)}
 
     def _escalate(self, state: PipelineState) -> dict:
         t, d = state["ticket"], state["decision"]
+        draft = self._agent_draft(state)
+        handoff = d.handoff.model_dump() if d.handoff else None
+        if handoff is not None:
+            handoff["draft_reply"] = draft
         outcome = TicketOutcome(ticket_id=t.ticket_id, channel=t.channel.value, outcome="escalated", reason=d.reason,
                                 decided_by=d.decided_by, intent=d.intent, urgency=d.urgency, confidence=d.confidence,
-                                sources=[s.model_dump() for s in d.sources],
-                                handoff=d.handoff.model_dump() if d.handoff else None)
+                                sources=[s.model_dump() for s in d.sources], handoff=handoff, draft_reply=draft,
+                                language=t.language)
         if state.get("outbound") is not None:
             outcome.guardrail = state["outbound"].guardrail.model_dump(mode="json")
         return {"outcome": outcome}
+
+    def _agent_draft(self, state: PipelineState) -> Optional[dict]:
+        """A reply drafted for the agent, cited to the articles where the solution is likely to be.
+        It is never sent automatically: the agent reviews it, edits it and sends it. The guardrails
+        check it the same way as an automatic reply, and the agent sees what they found."""
+        if os.getenv("AGENT_DRAFTS", "on").lower() in ("0", "off", "false", "no"):
+            return None
+        t, r = state["ticket"], state.get("retrieval")
+        if r is None or not t.processable:
+            return None
+        a = state.get("answer")
+        if a is not None and a.status == "insufficient_information":
+            return {"status": "not_drafted",
+                    "note": f"The articles found do not answer this: {a.missing_information or 'not covered'}"}
+        if a is None or a.status != "answered":      # draft from what was found, near misses included
+            refs = [(p.chunk_id, p.score) for p in r.passages] or [(c.chunk_id, c.score) for c in r.candidates[:2]]
+            if not refs:
+                return {"status": "not_drafted", "note": "No documentation was found, so nothing was drafted."}
+            passages = self.retriever.passages_for(refs, via="agent_draft")
+            draft_r = r.model_copy(update={"passages": passages, "status": "ok"})
+            a = self.generator.generate(t, draft_r, purpose="agent_draft")
+            self.store.log_generate(a, t.text, state.get("run_id"))
+        else:
+            draft_r = r
+        if a.status != "answered":
+            return {"status": "not_drafted",
+                    "note": f"The articles found do not answer this: {a.missing_information or 'not covered'}"}
+        g = self.guardrails.check(t, a, draft_r)
+        issues = [f.detail for ch in g.checks for f in ch.findings if f.severity == "block"]
+        self.store.record(t.ticket_id, "draft", "drafted", "Cited draft prepared for the agent; not sent. "
+                          + ("Guardrails found nothing." if not issues else f"Guardrails flagged: {issues[0]}"),
+                          sources=[s.model_dump() for s in a.sources], guardrails=[c.model_dump() for c in g.checks],
+                          prompt_version=a.prompt_version, run_id=state.get("run_id"), input_text=t.text,
+                          model_version=a.model or a.generator)
+        return {"status": "drafted", "text": mask_pii(a.answer_text), "text_en": mask_pii(a.answer_text_en),
+                "language": a.reply_language, "sources": [s.model_dump() for s in a.sources],
+                "generator": a.generator, "guardrail_passed": not issues, "guardrail_issues": issues,
+                "note": "Drafted by AI from the cited articles for the agent to review, edit and send. Not sent."}
 
     def _kill_switch(self, state: PipelineState) -> dict:
         t = state["ticket"]
@@ -381,8 +451,11 @@ class SupportPipeline:
 
 def _minimal_handoff(t: NormalisedTicket, detail: str) -> dict:
     return {"summary": f"Ticket {t.ticket_id} via {t.channel.value}. {detail} Customer wrote: \"{t.text[:280]}\"",
-            "uncertainties": [detail], "sources": [], "priority": "P2", "suggested_team": "tier1",
-            "original_text": t.original_body}
+            "escalation_category": "kill_switch" if "kill switch" in detail else "error",
+            "uncertainties": [detail], "sources": [], "documents": [], "priority": "P2", "suggested_team": "tier1",
+            "language": t.language, "original_text": t.original_body,
+            "conversation": list(t.conversation) + [{"role": "customer", "text": t.original_text or t.text,
+                                                     "at": t.received_at_raw}]}
 
 
 # ------------------------------------------------------------------ the ticket format, for the docs page

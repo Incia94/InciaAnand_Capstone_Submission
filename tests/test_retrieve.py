@@ -211,15 +211,60 @@ def test_build_retriever_without_index_degrades_not_crashes(tmp_path):
     r = R.build_retriever(DOCS, persist_dir=tmp_path / "missing", config_path=tmp_path / "none.json",
                           embed=FakeEmbedder().embed)
     res = r.retrieve("webhook signature verification fails")
-    assert res.backend == "lexical" and res.degraded and "dense unavailable" in res.reason
+    assert res.backend == "lexical" and res.degraded and "unavailable" in res.reason
 
 
 def test_build_retriever_uses_chroma_when_present(tmp_path):
     fake = FakeEmbedder()
     ingest.ingest_docs(DOCS, tmp_path / "chroma", embedder=fake)
-    r = R.build_retriever(DOCS, persist_dir=tmp_path / "chroma", config_path=tmp_path / "none.json", embed=fake.embed)
+    r = R.build_retriever(DOCS, persist_dir=tmp_path / "chroma", config_path=tmp_path / "none.json", embed=fake.embed,
+                          backend="dense")
     res = r.retrieve(r.corpus.resolve("DOC-BILL-002::full").text)
     assert res.backend == "dense" and not res.degraded and res.passages[0].doc_id == "DOC-BILL-002"
+
+
+def test_hybrid_is_the_default_and_combines_both(tmp_path, monkeypatch):
+    """Requirement: keyword search is not the only way in. The default backend scores every
+    article by meaning (dense) and by wording (lexical) together."""
+    monkeypatch.delenv("RETRIEVAL_BACKEND", raising=False)
+    fake = FakeEmbedder()
+    ingest.ingest_docs(DOCS, tmp_path / "chroma", embedder=fake)
+    r = R.build_retriever(DOCS, persist_dir=tmp_path / "chroma", config_path=tmp_path / "none.json", embed=fake.embed)
+    assert r.primary.name == "hybrid" and r.primary.dense.name == "dense" and r.primary.lexical.name == "lexical"
+    text = r.corpus.resolve("DOC-BILL-002::full").text
+    res = r.retrieve(text)
+    assert res.backend == "hybrid" and not res.degraded and res.passages[0].doc_id == "DOC-BILL-002"
+    dense, lexical = dict(r.primary.dense.search(text, 29)), dict(r.primary.lexical.search(text, 29))
+    cid = "DOC-BILL-002::full"
+    assert res.passages[0].score == pytest.approx(0.7 * dense[cid] + 0.3 * lexical[cid], abs=1e-3)
+
+
+def test_hybrid_falls_back_to_lexical_when_dense_fails(corpus):
+    class Broken:
+        name = "dense"
+
+        def search(self, text, k):
+            raise RuntimeError("model down")
+    r = R.Retriever(corpus, primary=R.HybridSearch(Broken(), R.LexicalSearch(corpus), len(corpus.chunks)))
+    res = r.retrieve("webhook signature verification fails")
+    assert res.backend == "lexical" and res.degraded and "model down" in res.reason and res.passages
+
+
+def test_intent_hint_rescues_a_near_miss_only_from_the_intents_articles(corpus):
+    r = R.Retriever(corpus, thresholds={"lexical": 0.99, "lexical_hint": 0.05})
+    q = "my signatures never match on the deliveries you send"
+    plain = r.retrieve(q)
+    assert plain.status == "no_relevant_passage" and not plain.passages
+    hinted = r.retrieve(q, hint_docs=["DOC-API-003"])
+    assert hinted.passages and hinted.passages[0].doc_id == "DOC-API-003" and hinted.passages[0].via == "intent_hint"
+    assert hinted.hinted and "intent-guided" in hinted.reason
+    assert not r.retrieve(q, hint_docs=["DOC-NOPE-001"]).passages      # only the intent's own articles
+
+
+def test_calibrate_sets_a_lower_hint_threshold(tmp_path, corpus, dev):
+    out = R.calibrate(R.Retriever(corpus), dev, tmp_path / "retrieval.json")
+    assert 0 < out["thresholds"]["lexical_hint"] <= out["thresholds"]["lexical"]
+    assert out["metrics"]["lexical_hint"]["near_misses"] > 0
 
 
 def test_calibrate_writes_thresholds(tmp_path, corpus, dev):
@@ -236,3 +281,10 @@ def test_cli_search_and_compare(tmp_path, capsys, monkeypatch):
     assert '"status"' in capsys.readouterr().out
     assert R.main(["--backend", "lexical", "compare", "--output", str(tmp_path / "c.json")]) == 0
     assert json.loads((tmp_path / "c.json").read_text())["recommended"] == "document"
+
+
+@pytest.mark.parametrize("argv", [["--backend", "lexical", "compare"], ["compare", "--backend", "lexical"]])
+def test_cli_backend_option_works_before_or_after_the_command(argv, tmp_path, capsys):
+    assert R.main(argv + ["--output", str(tmp_path / "c.json")]) == 0
+    assert json.loads((tmp_path / "c.json").read_text())["backend"] == "lexical"
+    capsys.readouterr()

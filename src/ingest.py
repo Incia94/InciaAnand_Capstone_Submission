@@ -159,6 +159,11 @@ class NormalisedTicket(BaseModel):
     customer_region: Region = Region.unknown
     language_fluency: Fluency = Fluency.unknown
     referenced_doc_ids: list[str] = []      # e.g. DOC-API-001 mentioned in the ticket
+    language: str = "en"                    # ISO 639-1 code from detect_language(); "und" if unknown
+    language_confidence: float = 1.0
+    translated: bool = False                # True when subject/body/text hold an English translation
+    original_text: str = ""                 # subject + body as the customer wrote them, before translation
+    conversation: list[dict] = []           # earlier messages, oldest first: {"role", "text", "at"}
     word_count: int = 0
     processable: bool = True                # False -> nothing usable to answer; route must escalate
     flags: list[str] = []                   # every repair or problem noticed, for the decision log
@@ -420,6 +425,9 @@ def normalise_ticket(raw: Any) -> NormalisedTicket:
         fluency = _enum(_get(raw, "language_fluency"), Fluency, flags, "language_fluency")
 
         labels, history = raw.get("labels"), raw.get("history")
+        language, lang_conf = detect_language(text)
+        if language not in ("en", "und"):
+            flags.append(f"language_{language}")
         return NormalisedTicket(
             ticket_id=ticket_id,
             channel=channel,
@@ -435,6 +443,10 @@ def normalise_ticket(raw: Any) -> NormalisedTicket:
             customer_region=region,
             language_fluency=fluency,
             referenced_doc_ids=sorted(set(_DOC_ID.findall(text))),
+            language=language,
+            language_confidence=lang_conf,
+            original_text=text,
+            conversation=parse_conversation(raw, flags),
             word_count=len(text.split()),
             processable=processable,
             flags=list(dict.fromkeys(flags)),             # de-duplicate, keep order
@@ -445,6 +457,77 @@ def normalise_ticket(raw: Any) -> NormalisedTicket:
         log.exception("unexpected error normalising ticket")
         return NormalisedTicket(ticket_id=_fallback_id(raw), channel=Channel.unknown, processable=False,
                                 flags=flags + [f"normalisation_error:{type(exc).__name__}"], **originals)
+
+
+# ------------------------------------------------------------------ tickets: language
+# A dependency-free detector, enough to decide "is this English, and if not, what is it?".
+# Scripts settle most languages outright; Latin-script languages are told apart by their most
+# common function words. Short or mixed text defaults to English ("en") with low confidence,
+# so a non-English ticket is never mistaken for English when it has enough words to tell.
+_SCRIPTS = [("zh", r"[\u4e00-\u9fff]"), ("ja", r"[\u3040-\u30ff]"), ("ko", r"[\uac00-\ud7af]"),
+            ("ru", r"[\u0400-\u04ff]"), ("ar", r"[\u0600-\u06ff]"), ("hi", r"[\u0900-\u097f]"),
+            ("th", r"[\u0e00-\u0e7f]"), ("he", r"[\u0590-\u05ff]"), ("el", r"[\u0370-\u03ff]")]
+_STOPWORDS = {
+    "en": "the and to of is in it that for you we our not with this have are be on my can i".split(),
+    "es": "el la los las de que y en un una es por para con no se mi nuestro está como pero".split(),
+    "fr": "le la les de des et est un une que pour pas avec nous notre dans je ne sur mon".split(),
+    "de": "der die das und ist nicht ein eine mit wir unser ich zu den auf für von sie es".split(),
+    "pt": "o a os as de que e em um uma não para com nosso nossa está se por é como".split(),
+    "it": "il la di che e è un una per non con nostro nostra sono si ho mi come ma".split(),
+    "nl": "de het een en is niet van ik wij ons onze met op voor dat te zijn".split(),
+}
+LANGUAGE_NAMES = {"en": "English", "es": "Spanish", "fr": "French", "de": "German", "pt": "Portuguese",
+                  "it": "Italian", "nl": "Dutch", "zh": "Chinese", "ja": "Japanese", "ko": "Korean",
+                  "ru": "Russian", "ar": "Arabic", "hi": "Hindi", "th": "Thai", "he": "Hebrew", "el": "Greek",
+                  "und": "an unidentified language"}
+
+
+def detect_language(text: str) -> tuple[str, float]:
+    """(ISO 639-1 code, confidence 0-1). Never raises."""
+    try:
+        letters = [ch for ch in text if ch.isalpha()]
+        if not letters:
+            return "und", 0.0
+        for code, pattern in _SCRIPTS:
+            share = len(re.findall(pattern, text)) / len(letters)
+            if share > 0.3:
+                return code, round(min(1.0, share + 0.2), 2)
+        words = re.findall(r"[a-zà-öø-ÿ]+", text.lower())
+        if len(words) < 4:
+            return "en", 0.5
+        counts = {lang: sum(w in sw for w in words) for lang, sw in _STOPWORDS.items()}
+        best = max(counts, key=counts.get)
+        if counts[best] == 0:
+            return "en", 0.4
+        second = sorted(counts.values())[-2]
+        conf = round((counts[best] - second) / max(counts[best], 1), 2)
+        if best != "en" and (counts[best] < 2 or conf < 0.3):
+            return "en", 0.5          # too close to call: treat as English
+        return best, max(conf, 0.5)
+    except Exception:
+        return "en", 0.0
+
+
+def parse_conversation(raw: dict, flags: list[str]) -> list[dict]:
+    """Earlier messages in the thread, if the channel supplies them (`conversation`, `messages`
+    or `thread`: a list of strings or of {role/author, text/body, at/sent_at}). Oldest first."""
+    for key in ("conversation", "messages", "thread"):
+        items = raw.get(key)
+        if isinstance(items, list) and items:
+            out = []
+            for it in items[:50]:
+                if isinstance(it, dict):
+                    text = clean_text(next((it[k] for k in ("text", "body", "content", "message") if k in it), ""), [])
+                    role = to_str(it.get("role") or it.get("author") or it.get("from") or "customer", []).strip()
+                    at = to_str(it.get("at") or it.get("sent_at") or it.get("timestamp") or "", []).strip()
+                else:
+                    text, role, at = clean_text(it, []), "customer", ""
+                if text:
+                    out.append({"role": role or "customer", "text": text[:MAX_BODY_CHARS], "at": at})
+            if out:
+                flags.append(f"conversation_{len(out)}_messages")
+            return out
+    return []
 
 
 # ------------------------------------------------------------------ tickets: files

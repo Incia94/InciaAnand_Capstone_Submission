@@ -28,7 +28,14 @@ forbidden_claims nothing the senior agents' must_not_claim lists rule out: that 
 secret_request   the reply does not ask the customer to send a password, key, token or code
 injection        the reply does not repeat our instructions or show signs of following a
                  customer's instructions (e.g. "ignore previous instructions")
+                 + money_claim: no amounts, charges, credits, refunds or waivers (billing replies
+                 explain how billing works only in the articles' general terms)
+                 + roadmap_claim: no future features, plans, release timing
+                 + compliance_commitment: no guarantees, certifications or legal promises
+                 (structure also blocks any answered reply that does not cite at least one article)
 tone             no insults or profanity (block); shouting in capitals is recorded as a warning
+translation      a reply translated for a non-English customer carries exactly the numbers and
+                 citation markers of the verified English version printed below it
 
 The support threshold (0.45)
 ----------------------------
@@ -188,9 +195,31 @@ _FORBIDDEN = [
         r"\d{1,2}(?:st|nd|rd|th)?\b|january|february|march|april|may|june|july|august|september|october|"
         r"november|december)", re.I)),
 ]
+_FORBIDDEN += [
+    ("money_claim", re.compile(       # billing: no claims about money at all (amounts, charges, credits)
+        r"[$€£₹¥]\s?\d|\b\d[\d,.]*\s?(?:usd|eur|gbp|inr|dollars?|euros?|pounds?|rupees?)\b|\b(?:usd|eur|gbp|inr)\s?\d"
+        r"|\byou (?:will|won't|would|are|aren't|shall)(?: not)? (?:be )?(?:charged|billed|refunded|credited|invoiced)\b"
+        r"|\b(?:waive[ds]?|waiving|free of charge|at no (?:extra |additional )?cost|no charge|credit of|refund of"
+        r"|you owe|amount (?:due|owed)|money back|compensat\w+)\b", re.I)),
+    ("roadmap_claim", re.compile(     # no future features, plans or timelines
+        r"\b(?:will be|is going to be|are going to be) (?:available|released|launched|added|supported|introduced)\b"
+        r"|\b(?:planned|scheduled) for\b|\bon (?:our|the) roadmap\b"
+        r"|\b(?:in|with) (?:an upcoming|a future|the next|a later) (?:release|version|update)\b|\bcoming soon\b"
+        r"|\bby (?:q[1-4]|the end of|next (?:week|month|quarter|year))\b|\bwe (?:plan|intend|expect) to\b", re.I)),
+    ("compliance_commitment", re.compile(   # no promises about compliance, data location or legal duties
+        r"\b(?:we|cloudserve) (?:guarantee|certify|warrant|promise)s?\b|\bguaranteed?\b"
+        r"|\b(?:gdpr|hipaa|soc ?2|iso ?27001|pci[- ]dss)[- ](?:compliant|certified)\b|\blegally binding\b"
+        r"|\byour data will (?:never|always|only)\b", re.I)),
+]
 _FORBIDDEN_LABELS = {"refund_promise": "says a refund has been or will be issued",
                      "fix_claim": "says the issue has been fixed on our side",
-                     "fix_date": "gives a date or time for a fix"}
+                     "fix_date": "gives a date or time for a fix",
+                     "money_claim": "makes a claim about money (an amount, a charge, a credit or a refund)",
+                     "roadmap_claim": "talks about future features, plans or timing",
+                     "compliance_commitment": "makes a compliance or legal commitment"}
+_MARKER = re.compile(r"\[\d+\]")
+_DIGITS = re.compile(r"\d+(?:[.,]\d+)?")
+ENGLISH_DIVIDER = "\n\n---\nEnglish version:\n"
 _SECRET_REQUEST = re.compile(
     r"\b(send|share|provide|give|email|paste|tell|reply with|forward)\b[^.]{0,40}\b(password|api key|secret|"
     r"token|credential|private key|recovery code|mfa code|verification code|2fa code)", re.I)
@@ -224,7 +253,7 @@ class Guardrails:
         for name, fn in (("structure", self._structure), ("private_data", self._private_data),
                          ("claim_support", self._claim_support), ("forbidden_claims", self._forbidden),
                          ("secret_request", self._secret_request), ("injection", self._injection),
-                         ("tone", self._tone)):
+                         ("tone", self._tone), ("translation", self._translation)):
             try:
                 findings, stats = fn(t, answer, retrieval)
             except Exception as exc:   # a check that cannot run must not wave a reply through
@@ -278,6 +307,9 @@ class Guardrails:
                 elif self.corpus is not None and not self.corpus.verify(cid, retrieved[cid].text):
                     f.append(Finding(kind="citation_not_in_corpus", severity="block", claim_index=i,
                                      detail=f"Claim {i + 1} cites {cid}, which does not match the documentation."))
+        if a.status == "answered" and not a.sources:
+            f.append(Finding(kind="no_article_cited", severity="block",
+                             detail="The reply does not cite a help article, and every automated reply must."))
         cited = {cid for c in a.claims for cid in c.citations}
         if cited != {s.chunk_id for s in a.sources}:
             f.append(Finding(kind="source_list_mismatch", severity="block",
@@ -323,7 +355,7 @@ class Guardrails:
                    "threshold": self.support_threshold}
 
     def _forbidden(self, t, a: GeneratedAnswer, r):
-        text = a.answer_text if a.answer_text != DONT_KNOW else ""
+        text = (a.answer_text_en or a.answer_text) if a.answer_text != DONT_KNOW else ""
         return [Finding(kind=k, severity="block", detail=f"The reply {_FORBIDDEN_LABELS[k]} (\"{m.group()[:60]}\").")
                 for k, p in _FORBIDDEN for m in p.finditer(text)], {}
 
@@ -347,6 +379,24 @@ class Guardrails:
                                     f"(\"{m.group()[:40]}\")."))
         attempt = bool(_INJECTION_SIGNS.search(t.text)) or "system:" in t.text.lower()
         return f, {"ticket_contains_injection_attempt": attempt}
+
+    def _translation(self, t, a: GeneratedAnswer, r):
+        """A translated reply must say what the verified English says: the same numbers and the
+        same citation markers. (Wording is checked in English; numbers catch changed amounts,
+        limits and dates in any language.)"""
+        if a.reply_language in ("", "en") or ENGLISH_DIVIDER not in a.answer_text:
+            return [], {"translated": False}
+        local, english = a.answer_text.split(ENGLISH_DIVIDER, 1)
+        f = []
+        extra = set(_DIGITS.findall(_MARKER.sub(" ", local))) - set(_DIGITS.findall(_MARKER.sub(" ", english)))
+        if extra:
+            f.append(Finding(kind="translation_changed_numbers", severity="block",
+                             detail="The translated reply contains numbers the English does not: "
+                                    f"{', '.join(sorted(extra))}."))
+        if sorted(_MARKER.findall(local)) != sorted(_MARKER.findall(english)):
+            f.append(Finding(kind="translation_changed_citations", severity="block",
+                             detail="The translated reply does not carry the same citations as the English."))
+        return f, {"translated": True, "language": a.reply_language}
 
     def _tone(self, t, a: GeneratedAnswer, r):
         f = [Finding(kind="insult_or_profanity", severity="block",

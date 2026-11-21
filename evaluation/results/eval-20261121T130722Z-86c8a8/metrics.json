@@ -1,0 +1,575 @@
+{
+  "run": {
+    "run_id": "eval-20261121T130722Z-86c8a8",
+    "input": "data/validation_tickets.json",
+    "input_sha256": "94c5b1adc1203f06d59522a909d755e8671e9bf1b165a0bc5a74ab62501c827b",
+    "tickets_in_file": 80,
+    "tickets_processed": 80,
+    "interrupted": false,
+    "started_at": "2026-11-21T13:07:22+00:00",
+    "finished_at": "2026-11-21T13:08:02+00:00",
+    "duration_s": 39.7,
+    "output_dir": "evaluation/results/eval-20261121T130722Z-86c8a8",
+    "decision_log": "evaluation/results/eval-20261121T130722Z-86c8a8/decisions.db",
+    "prepared": [],
+    "configuration": {
+      "python": "3.11.18",
+      "packages": {
+        "langgraph": "1.2.24",
+        "langchain-core": "1.8.4",
+        "chromadb": "1.5.9",
+        "scikit-learn": "1.7.2",
+        "sentence-transformers": "6.3.0",
+        "pydantic": "2.14.4"
+      },
+      "classifier": {
+        "ready": true,
+        "version": "tfidf-lr-C30-2e70ce0d"
+      },
+      "retrieval": {
+        "primary": "hybrid",
+        "fallback_only": false,
+        "reason": "",
+        "strategy": "document",
+        "thresholds": {
+          "dense": 0.45,
+          "lexical": 0.2273,
+          "hybrid": 0.3731,
+          "hybrid_hint": 0.2832,
+          "lexical_hint": 0.094
+        }
+      },
+      "routing": {
+        "threshold": 0.99,
+        "calibrated": true
+      },
+      "generator": {
+        "mode": "llm",
+        "client": "LangChainChatClient",
+        "model": "meta-llama/llama-3.1-8b-instruct",
+        "reason": "",
+        "prompt_version": "generate_answer.v2@070979e0+generate_answer_user.v1@43bfc0bd+repair_reply.v1@8fe5a390"
+      },
+      "kill_switch": false
+    }
+  },
+  "reconcile": {
+    "run_id": "eval-20261121T130722Z-86c8a8",
+    "tickets_expected": 80,
+    "tickets_with_outcome": 80,
+    "decisions": 551,
+    "by_stage": {
+      "ingest": 80,
+      "classify": 80,
+      "retrieve": 80,
+      "route": 82,
+      "generate": 80,
+      "guardrail": 63,
+      "outcome": 80,
+      "draft": 6
+    },
+    "outcomes": {
+      "sent": 63,
+      "escalated": 17
+    },
+    "missing_outcome": [],
+    "duplicate_outcome": [],
+    "unexpected_tickets": [],
+    "write_failures": 0,
+    "reconciled": true
+  },
+  "metrics": {
+    "volume": {
+      "tickets_processed": 80,
+      "answered_automatically": 63,
+      "escalated": 17,
+      "blocked_by_guardrails": 0,
+      "escalated_by": {
+        "policy": 14,
+        "generate": 2,
+        "documentation": 1
+      },
+      "by_channel": {
+        "forum": 11,
+        "chat": 22,
+        "docs_comment": 16,
+        "email": 31
+      },
+      "errors": 0,
+      "unprocessable_input": 0,
+      "tickets_with_labels": 80
+    },
+    "business": {
+      "first_contact_resolution": 0.7875,
+      "first_contact_resolution_note": "Brief definition: tickets closed without escalation / total tickets.",
+      "correct_automatic_resolution": 0.5375,
+      "correct_automatic_resolution_note": "Sent, right intent, an expected document cited, and labelled auto_respond. Labelled tickets only.",
+      "wrong_automatic_answers": 20,
+      "escalation_rate": 0.2125,
+      "response_time_mean_s_sent": 0.408,
+      "response_time_median_s_sent": 0.406,
+      "response_time_mean_s_all": 0.431,
+      "response_time_median_s_all": 0.408,
+      "response_time_note": "System processing time from arrival to sent reply or escalation. An escalated ticket's time to a human reply is outside the system and not measured.",
+      "baseline_from_history": {
+        "tickets": 80,
+        "first_contact_resolution": 0.4625,
+        "escalation_rate": 0.5375,
+        "resolution_minutes_mean": 441.5,
+        "resolution_minutes_median": 218.0,
+        "csat_mean": 2.6
+      },
+      "repeat_contacts_note": "Not measurable in a single run: needs follow-up tickets after a reply."
+    },
+    "technical": {
+      "labelled_tickets": 80,
+      "intent_accuracy": 1.0,
+      "intent_precision_macro": 1.0,
+      "intent_recall_macro": 1.0,
+      "intent_f1_macro": 1.0,
+      "intent_per_class": {
+        "account_access": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "support": 4
+        },
+        "api_key_issue": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "support": 6
+        },
+        "api_usage_question": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "support": 4
+        },
+        "authentication_failure": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "support": 3
+        },
+        "billing_query": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "support": 10
+        },
+        "compliance_request": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "support": 1
+        },
+        "configuration_help": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "support": 3
+        },
+        "data_export": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "support": 1
+        },
+        "data_residency": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "support": 6
+        },
+        "database_issue": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "support": 1
+        },
+        "deployment_failure": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "support": 5
+        },
+        "feature_request": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "support": 3
+        },
+        "integration_help": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "support": 3
+        },
+        "onboarding": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "support": 4
+        },
+        "performance_degradation": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "support": 3
+        },
+        "quota_or_overage": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "support": 2
+        },
+        "rate_limit": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "support": 1
+        },
+        "rollback_request": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "support": 6
+        },
+        "security_incident": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "support": 4
+        },
+        "sso_configuration": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "support": 1
+        },
+        "unclear_request": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "support": 6
+        },
+        "webhook_issue": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "support": 3
+        }
+      },
+      "urgency_accuracy": 0.4625,
+      "calibration_ece": 0.01,
+      "calibration_gap": 0.01,
+      "calibration_reliability": [
+        {
+          "confidence_bin": "0.8-1.0",
+          "tickets": 80,
+          "mean_confidence": 0.99,
+          "accuracy": 1.0
+        }
+      ],
+      "routing_agreement_with_labels": 0.7375,
+      "routing_confusion": {
+        "expected auto_respond -> sent": 45,
+        "expected escalate -> escalated": 14,
+        "expected escalate -> sent": 18,
+        "expected auto_respond -> escalated": 3
+      },
+      "retrieval_hit_rate": 0.9434,
+      "retrieval_hit_at_1": 0.9434,
+      "retrieval_answerable_tickets": 53,
+      "citation_accuracy": 0.6875,
+      "citations_checked": 64,
+      "must_not_auto_respond_tickets": 14,
+      "citations_resolve_to_corpus": 1.0,
+      "hallucination_rate_drafts": 0.0,
+      "hallucination_rate_sent": 0.0,
+      "hallucination_note": "Claims the guardrails found unsupported by their cited passages. Drafts with unsupported claims are blocked, so the sent rate measures leaks past the check.",
+      "latency_p50_s": 0.4081,
+      "latency_p95_s": 0.8138,
+      "latency_max_s": 1.2417,
+      "availability": 1.0,
+      "degraded_tickets": {},
+      "generators_used": {
+        "llm": 63
+      },
+      "retrieval_backends_used": {
+        "hybrid": 80
+      }
+    },
+    "governance": {
+      "decisions_logged": 551,
+      "decisions_by_stage": {
+        "ingest": 80,
+        "classify": 80,
+        "retrieve": 80,
+        "route": 82,
+        "generate": 80,
+        "guardrail": 63,
+        "outcome": 80,
+        "draft": 6
+      },
+      "decision_logging_complete": true,
+      "tickets_missing_outcome": [],
+      "replies_checked_by_guardrails": 63,
+      "guardrail_activations_by_type": {},
+      "guardrail_findings_by_kind": {},
+      "private_data_detections": 0,
+      "private_data_in_sent_replies": 0,
+      "must_not_auto_respond_answered_automatically": 0,
+      "calibration_gap": 0.01,
+      "fairness": {
+        "customer_tier": {
+          "groups": {
+            "business": {
+              "tickets": 30,
+              "auto_rate": 0.9,
+              "correct_automatic_resolution": 0.6333,
+              "escalation_rate": 0.1
+            },
+            "enterprise": {
+              "tickets": 8,
+              "auto_rate": 0.875,
+              "correct_automatic_resolution": 0.75,
+              "escalation_rate": 0.125
+            },
+            "standard": {
+              "tickets": 42,
+              "auto_rate": 0.6905,
+              "correct_automatic_resolution": 0.4286,
+              "escalation_rate": 0.3095
+            }
+          },
+          "gaps": {
+            "auto_rate": {
+              "max_gap": 0.2095,
+              "over_threshold": true
+            },
+            "correct_automatic_resolution": {
+              "max_gap": 0.2047,
+              "over_threshold": true
+            },
+            "escalation_rate": {
+              "max_gap": 0.2095,
+              "over_threshold": true
+            }
+          },
+          "note": "Groups under 10 tickets are shown but not used for the gap."
+        },
+        "customer_region": {
+          "groups": {
+            "asia_pacific": {
+              "tickets": 21,
+              "auto_rate": 0.8571,
+              "correct_automatic_resolution": 0.619,
+              "escalation_rate": 0.1429
+            },
+            "europe": {
+              "tickets": 25,
+              "auto_rate": 0.8,
+              "correct_automatic_resolution": 0.56,
+              "escalation_rate": 0.2
+            },
+            "latin_america": {
+              "tickets": 7,
+              "auto_rate": 0.5714,
+              "correct_automatic_resolution": 0.4286,
+              "escalation_rate": 0.4286
+            },
+            "north_america": {
+              "tickets": 27,
+              "auto_rate": 0.7778,
+              "correct_automatic_resolution": 0.4815,
+              "escalation_rate": 0.2222
+            }
+          },
+          "gaps": {
+            "auto_rate": {
+              "max_gap": 0.0793,
+              "over_threshold": true
+            },
+            "correct_automatic_resolution": {
+              "max_gap": 0.1375,
+              "over_threshold": true
+            },
+            "escalation_rate": {
+              "max_gap": 0.0793,
+              "over_threshold": true
+            }
+          },
+          "note": "Groups under 10 tickets are shown but not used for the gap."
+        },
+        "language_fluency": {
+          "groups": {
+            "fluent": {
+              "tickets": 61,
+              "auto_rate": 0.7705,
+              "correct_automatic_resolution": 0.5902,
+              "escalation_rate": 0.2295
+            },
+            "non_fluent": {
+              "tickets": 19,
+              "auto_rate": 0.8421,
+              "correct_automatic_resolution": 0.3684,
+              "escalation_rate": 0.1579
+            }
+          },
+          "gaps": {
+            "auto_rate": {
+              "max_gap": 0.0716,
+              "over_threshold": true
+            },
+            "correct_automatic_resolution": {
+              "max_gap": 0.2218,
+              "over_threshold": true
+            },
+            "escalation_rate": {
+              "max_gap": 0.0716,
+              "over_threshold": true
+            }
+          },
+          "note": "Groups under 10 tickets are shown but not used for the gap."
+        },
+        "channel": {
+          "groups": {
+            "chat": {
+              "tickets": 22,
+              "auto_rate": 0.7273,
+              "correct_automatic_resolution": 0.5,
+              "escalation_rate": 0.2727
+            },
+            "docs_comment": {
+              "tickets": 16,
+              "auto_rate": 0.75,
+              "correct_automatic_resolution": 0.4375,
+              "escalation_rate": 0.25
+            },
+            "email": {
+              "tickets": 31,
+              "auto_rate": 0.8387,
+              "correct_automatic_resolution": 0.6129,
+              "escalation_rate": 0.1613
+            },
+            "forum": {
+              "tickets": 11,
+              "auto_rate": 0.8182,
+              "correct_automatic_resolution": 0.5455,
+              "escalation_rate": 0.1818
+            }
+          },
+          "gaps": {
+            "auto_rate": {
+              "max_gap": 0.1114,
+              "over_threshold": true
+            },
+            "correct_automatic_resolution": {
+              "max_gap": 0.1754,
+              "over_threshold": true
+            },
+            "escalation_rate": {
+              "max_gap": 0.1114,
+              "over_threshold": true
+            }
+          },
+          "note": "Groups under 10 tickets are shown but not used for the gap."
+        }
+      },
+      "fairness_max_gap": 0.2218
+    },
+    "escalations": {
+      "by_category": {
+        "policy": 14,
+        "documentation_incomplete": 2,
+        "no_documentation": 1
+      },
+      "by_team": {
+        "tier1": 8,
+        "security": 4,
+        "product": 3,
+        "compliance": 1,
+        "tier2": 1
+      },
+      "labelled_escalations": 17,
+      "genuine": 14,
+      "avoidable_findability": 3,
+      "avoidable_share_of_escalations": 0.1765,
+      "avoidable_by_category": {
+        "documentation_incomplete": 2,
+        "no_documentation": 1
+      },
+      "note": "genuine = labelled escalate; avoidable = labelled auto_respond with a documented answer.",
+      "intent_hint_answers": 9,
+      "drafts_for_agents": 6,
+      "drafts_passing_guardrails": 6,
+      "escalations_without_draft": 11
+    },
+    "languages": {
+      "by_language": {
+        "en": 80
+      },
+      "translated": 0,
+      "replies_in_customer_language": 0
+    },
+    "targets": [
+      {
+        "target": "Business: first contact resolution 60% or better",
+        "metric": "first_contact_resolution",
+        "value": 0.7875,
+        "goal": ">= 0.6",
+        "met": true
+      },
+      {
+        "target": "Business: escalation rate 30% or lower",
+        "metric": "escalation_rate",
+        "value": 0.2125,
+        "goal": "<= 0.3",
+        "met": true
+      },
+      {
+        "target": "Business: time to first reply under 5 minutes",
+        "metric": "response_time_mean_s_sent",
+        "value": 0.408,
+        "goal": "<= 300.0",
+        "met": true
+      },
+      {
+        "target": "Technical: intent classification precision 85% or better",
+        "metric": "intent_precision_macro",
+        "value": 1.0,
+        "goal": ">= 0.85",
+        "met": true
+      },
+      {
+        "target": "Technical: hallucination rate 5% or lower",
+        "metric": "hallucination_rate_sent",
+        "value": 0.0,
+        "goal": "<= 0.05",
+        "met": true
+      },
+      {
+        "target": "Technical: citation accuracy 95% or better",
+        "metric": "citation_accuracy",
+        "value": 0.6875,
+        "goal": ">= 0.95",
+        "met": false
+      },
+      {
+        "target": "Technical: response latency, 95th percentile, under 3 seconds",
+        "metric": "latency_p95_s",
+        "value": 0.8138,
+        "goal": "< 3.0",
+        "met": true
+      },
+      {
+        "target": "Governance: zero private data in outbound responses",
+        "metric": "private_data_in_sent_replies",
+        "value": 0,
+        "goal": "== 0",
+        "met": true
+      },
+      {
+        "target": "Governance: under 5 points between customer groups",
+        "metric": "fairness_max_gap",
+        "value": 0.2218,
+        "goal": "< 0.05",
+        "met": false
+      },
+      {
+        "target": "Governance: stated confidence within 5 points of accuracy",
+        "metric": "calibration_gap",
+        "value": 0.01,
+        "goal": "<= 0.05",
+        "met": true
+      },
+      {
+        "target": "Governance: every automated decision logged",
+        "metric": "decision_logging_complete",
+        "value": true,
+        "goal": "== True",
+        "met": true
+      }
+    ]
+  }
+}

@@ -53,7 +53,7 @@ STAGES = ("ingest", "classify", "retrieve", "route", "generate", "guardrail", "o
 # add your own PRD requirement ids (e.g. "FR-03") so every logged decision traces to a requirement.
 REQUIREMENT_IDS = {
     "ingest": ["A2"], "classify": ["A3"], "retrieve": ["A4"], "route": ["A5"], "generate": ["A6"],
-    "guardrail": ["A7"], "outcome": ["A8", "A9"], "error": ["A11"],
+    "guardrail": ["A7"], "outcome": ["A8", "A9"], "error": ["A11"], "translate": ["A2"], "draft": ["A5", "A6"],
 }
 
 SCHEMA = """
@@ -118,12 +118,26 @@ def mask_pii(text: Optional[str]) -> str:
     return PHONE_PATTERN.sub(lambda m: mask(m.group()) if len(re.sub(r"\D", "", m.group())) >= 9 else m.group(), text)
 
 
+def _mask_deep(value: Any) -> Any:
+    """Mask personal data in every string inside a structure, leaving numbers and keys alone."""
+    if isinstance(value, str):
+        return mask_pii(value)
+    if isinstance(value, dict):
+        return {k: _mask_deep(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_mask_deep(v) for v in value]
+    return value
+
+
 def _json(value: Any) -> Optional[str]:
+    """Serialise for the log. Every string inside is PII-masked first: free text such as a handoff
+    summary quotes the customer, so masking only input_text would not be enough."""
     if value is None:
         return None
     if hasattr(value, "model_dump"):
         value = value.model_dump(mode="json")
-    return json.dumps(value, ensure_ascii=False, default=str)
+    value = json.loads(json.dumps(value, ensure_ascii=False, default=str))
+    return json.dumps(_mask_deep(value), ensure_ascii=False)
 
 
 def _sqlite_path(url: str) -> Path:
@@ -180,7 +194,7 @@ class DecisionStore:
             "confidence": None if confidence is None else float(confidence),
             "threshold": None if threshold is None else float(threshold),
             "action_taken": str(action_taken or "none"),
-            "reason": str(reason or "no reason recorded"),
+            "reason": mask_pii(str(reason or "no reason recorded")),
             "sources_used": _json(sources),
             "guardrails": _json(guardrails),
             "prompt_version": prompt_version,
@@ -267,7 +281,11 @@ class DecisionStore:
                            latency_ms=a.latency_ms,
                            details={"claims": [c.model_dump() for c in a.claims], "attempts": a.attempts,
                                     "answer_text": mask_pii(a.answer_text), "raw_output": mask_pii(a.raw_output),
-                                    "missing_information": a.missing_information})
+                                    "missing_information": a.missing_information,
+                                    "purpose": getattr(a, "purpose", "reply"),
+                                    "reply_language": getattr(a, "reply_language", "en"),
+                                    "translation_error": getattr(a, "translation_error", ""),
+                                    "data_policy": getattr(a, "data_policy", "")})
 
     def log_guardrail(self, v: Any, ticket_text: str = "", run_id: Optional[str] = None) -> str:
         return self.record(v.ticket_id, "guardrail", "released" if v.released else "blocked", v.reason,

@@ -14,16 +14,23 @@ Usage (run from the project root)
 
 The decision
 ------------
-Six checks, in this order. The first that fails decides the escalation; all are recorded.
+Eight checks, in this order. The first that fails decides the escalation; all are recorded.
 
   1 readable       the ticket has usable text
-  2 classified     the classifier produced an intent (not its fallback)
-  3 policy         the intent is not one that must always go to a person. The set is taken from
+  2 language       the ticket is in English, or was translated into English for processing
+                   (a ticket that could not be translated goes to a person who reads it)
+  3 classified     the classifier produced an intent (not its fallback)
+  4 policy         the intent is not one that must always go to a person. The set is taken from
                    the training labels (must_not_auto_respond): security_incident,
                    compliance_request, feature_request, unclear_request
-  4 documentation  retrieval found at least one passage above its relevance threshold
-  5 confidence     intent confidence >= the threshold
-  6 consistency    the best article is one that tickets of this intent have needed before
+  5 topic          the text itself is not about a subject that is never answered automatically,
+                   whatever the classifier said (a second, independent safety net; see TOPICS):
+                   security problems, roadmap / timing / feature requests, service incidents,
+                   billing disputes, and requests for compliance commitments
+  6 documentation  retrieval found at least one passage above its relevance threshold (or, when
+                   switched on, an intent-guided match; see src/retrieve.py)
+  7 confidence     intent confidence >= the threshold
+  8 consistency    the best article is one that tickets of this intent have needed before
                    (learned from expected_doc_ids), so classifier and search agree
 
 If all pass, the ticket is answered automatically.
@@ -32,7 +39,7 @@ The threshold
 -------------
 `calibrate` classifies every development ticket with a classifier that did not see it (two
 cross-validations: one holding out whole groups of near-duplicates, i.e. new wording, one ordinary
-split, i.e. familiar wording), retrieves for it, and replays the six checks at every candidate
+split, i.e. familiar wording), retrieves for it, and replays the checks at every candidate
 threshold from 0.50 to 0.99. Each threshold is scored as
 
     cost = cost_ratio x (wrong automatic answers) + (unnecessary escalations)
@@ -44,6 +51,15 @@ is a business judgement, not a fact in the data: it is a setting (ROUTING_COST_R
 calibrate reports the threshold each ratio from 2 to 10 would choose. The lowest-cost threshold is
 saved in storage/routing.json with the whole cost curve. Lower thresholds win ties, so automation
 is never given up for nothing.
+
+Findability (INTENT_HINT=on|off|auto, default on)
+-----------
+Calibrate replays everything twice, with and without intent-guided search, and stores both costs
+(hint_comparison). "on" uses it, so tickets are not escalated just because the customer's wording
+missed the article; "auto" uses it only if it lowers the cost at the chosen cost ratio. On the
+development data it removes most findability escalations; the price is a few more automatic
+replies to tickets labelled escalate, many of which have twins with identical text labelled
+auto_respond (discovery finding E24). Which way to set it is a business decision for the report.
 """
 from __future__ import annotations
 
@@ -52,6 +68,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sys
 import time
 from collections import Counter
@@ -61,8 +78,8 @@ from typing import Any, Iterable, Optional, Sequence
 from pydantic import BaseModel
 
 from src.classify import Classification, Classifier, near_duplicate_groups
-from src.ingest import NormalisedTicket, load_tickets, normalise_ticket
-from src.retrieve import RetrievalResult
+from src.ingest import LANGUAGE_NAMES, NormalisedTicket, load_tickets, normalise_ticket
+from src.retrieve import RetrievalResult, intent_doc_map
 
 log = logging.getLogger("route")
 
@@ -83,6 +100,55 @@ SUGGESTED_TEAM = {
 }
 PRIORITY = {"high": "P1", "medium": "P2", "low": "P3"}
 
+# Subjects never answered automatically, detected from the ticket's own words (case-insensitive).
+# A match escalates even when the classifier thought the ticket was something else. Each pattern
+# was checked against the 580 labelled tickets: security matches 25 tickets, all labelled
+# escalate; roadmap matches 20 feature requests and 0 tickets labelled auto_respond. A phrase
+# preceded by a negation ("it does not look like an outage") does not count.
+TOPICS: dict[str, tuple[str, str, str]] = {   # name -> (pattern, team, plain-language reason)
+    "security": (
+        r"\b(?:compromis\w*|breach\w*|hack(?:ed|er|ers)?|unauthori[sz]ed (?:access|activity|logins?|use|api calls?)"
+        r"|unrecogni[sz]ed (?:activity|logins?|api calls?|resources?)|suspicious (?:activity|logins?|traffic)"
+        r"|vulnerabilit\w*|exploit\w*|malware|ransomware|phishing|cve-\d+|penetration test\w*"
+        r"|someone (?:else )?(?:has|had|got|gained) access|still (?:has|have) access|retained access"
+        r"|after (?:they )?(?:left|leaving)[^.]{0,40}access|access[^.]{0,40}after (?:they )?(?:left|leaving))",
+        "security", "it describes a possible security problem, which a person must always handle"),
+    "roadmap": (
+        r"\b(?:roadmap|when will (?:you|it|this|that|cloudserve|the feature)|eta\b|timeline for|release date"
+        r"|is there (?:any )?plans?|are there (?:any )?plans|any plans to|planned (?:feature|release)|coming soon"
+        r"|future release|feature request|would (?:love|like) (?:you |cloudserve )?to (?:add|see|support|offer)"
+        r"|please (?:add|consider adding)|could you add|can you add)",
+        "product", "it asks about a new feature, the roadmap or timing, which the documentation does not cover "
+                   "and only the product team can answer"),
+    "incident": (
+        r"\b(?:outage|is (?:cloudserve|the platform|your (?:service|platform|api|console)) down|status page"
+        r"|platform[- ]wide|region[- ]wide|across all (?:regions|projects)|multiple customers"
+        r"|other customers (?:are|have)|everyone (?:is|on))",
+        "incident", "it may be a new service incident, which needs a person to investigate"),
+    "billing_dispute": (
+        r"\b(?:disput\w*|chargeback|overcharg\w*|charged (?:twice|double|two times)|double[- ]charg\w*"
+        r"|(?:want|need|request|requesting|like) (?:a |our )?refund|refund (?:us|me|the)|money back"
+        r"|wrong(?:ly)? charged|incorrect(?:ly)? charged|not authori[sz]e[^.]{0,30}charge)",
+        "billing", "it disputes a charge or asks for money back, which only the billing team can decide"),
+    "compliance_commitment": (
+        r"\b(?:legally binding|certif(?:y|ied|ication)|attest\w*|sign (?:a|our|the|your) (?:dpa|contract|agreement"
+        r"|addendum)|\bdpa\b|data processing (?:agreement|addendum)|hipaa|soc ?2|iso ?27001|pci[- ]dss|audit report)",
+        "compliance", "it asks CloudServe for a compliance or legal commitment, which a person must give"),
+}
+_TOPIC_RX = {k: re.compile(v[0], re.I) for k, v in TOPICS.items()}
+_NEGATED = re.compile(r"\b(?:not|no|n't|never|without)\b[^.]{0,25}$", re.I)
+
+
+def detect_topics(text: str) -> dict[str, str]:
+    """{topic: the words that matched} for every never-automate topic found in the text."""
+    found = {}
+    for name, rx in _TOPIC_RX.items():
+        for m in rx.finditer(text):
+            if not _NEGATED.search(text[max(0, m.start() - 30):m.start()]):
+                found[name] = m.group()
+                break
+    return found
+
 
 # ------------------------------------------------------------------ configuration
 class RoutingConfig(BaseModel):
@@ -90,6 +156,8 @@ class RoutingConfig(BaseModel):
     cost_ratio: float = DEFAULT_COST_RATIO
     must_escalate_intents: list[str] = list(DEFAULT_MUST_ESCALATE)
     intent_docs: dict[str, list[str]] = {}          # intent -> documents its tickets have needed
+    use_intent_hint: bool = False                   # intent-guided search; set by calibrate from data
+    hint_comparison: dict = {}                      # cost with and without it, from calibrate
     calibrated: bool = False
     calibrated_on: int = 0
     curve: list[dict] = []
@@ -99,7 +167,8 @@ class RoutingConfig(BaseModel):
     @property
     def version(self) -> str:
         core = json.dumps({"t": self.confidence_threshold, "m": sorted(self.must_escalate_intents),
-                           "d": {k: sorted(v) for k, v in sorted(self.intent_docs.items())}}, sort_keys=True)
+                           "d": {k: sorted(v) for k, v in sorted(self.intent_docs.items())},
+                           "h": self.use_intent_hint, "topics": sorted(TOPICS)}, sort_keys=True)
         return "route-" + hashlib.sha256(core.encode()).hexdigest()[:10]
 
     @classmethod
@@ -107,7 +176,11 @@ class RoutingConfig(BaseModel):
         """routing.json if present (data-derived); otherwise CONFIDENCE_THRESHOLD or 0.80."""
         path = Path(path or os.getenv("ROUTING_CONFIG", DEFAULT_CONFIG))
         try:
-            return cls.model_validate_json(path.read_text())
+            cfg = cls.model_validate_json(path.read_text())
+            mode = os.getenv("INTENT_HINT", "").strip().lower()
+            if mode in ("on", "off"):          # the setting wins over what calibrate stored
+                cfg.use_intent_hint = mode == "on"
+            return cfg
         except (OSError, ValueError):
             log.warning("no usable %s: using threshold %s until `python -m src.route calibrate` runs",
                         path, os.getenv("CONFIDENCE_THRESHOLD", DEFAULT_THRESHOLD))
@@ -134,18 +207,36 @@ class SourceRef(BaseModel):
     above_threshold: bool      # False: a near miss, shown to the agent but not trusted
 
 
+class DocumentPointer(BaseModel):
+    """Where the solution is likely to be, for the agent: the article and the part that matters."""
+    doc_id: str
+    chunk_id: str
+    title: str
+    score: float
+    matched: bool               # True: passed the relevance threshold; False: the closest near miss
+    excerpt: str                # the resolution steps (or opening) of the article
+
+
 class Handoff(BaseModel):
-    """What a person receives with an escalated ticket."""
-    summary: str
+    """What a person receives with an escalated ticket: enough to act without re-reading
+    everything or searching the documentation again."""
+    summary: str                # one paragraph: who, what, why it was escalated, where to look
+    escalation_category: str    # policy | topic | language | no_documentation | low_confidence | ...
     suggested_team: str
     priority: str
     uncertainties: list[str]
+    tier1_checks: list[dict]    # every check the system ran and what it found
     sources: list[SourceRef]
+    documents: list[DocumentPointer] = []
     intent_guess: str
     intent_alternatives: list[dict]
     customer: dict
     channel: str
+    language: str = "en"
+    conversation: list[dict]    # earlier messages, then this ticket, oldest first (original wording)
+    english_translation: Optional[str] = None   # when the customer did not write in English
     original_text: str
+    draft_reply: Optional[dict] = None          # added by the pipeline: a cited draft for the agent
 
 
 class RoutingDecision(BaseModel):
@@ -206,6 +297,53 @@ def _excerpt(text: str, limit: int = 280) -> str:
     return text if len(text) <= limit else text[:limit].rsplit(" ", 1)[0] + "…"
 
 
+def _documents(r: RetrievalResult, limit: int = 3) -> list[DocumentPointer]:
+    out, seen = [], set()
+    for p in r.passages:
+        if p.doc_id not in seen:
+            seen.add(p.doc_id)
+            out.append(DocumentPointer(doc_id=p.doc_id, chunk_id=p.chunk_id, title=p.title, score=p.score,
+                                       matched=True, excerpt=_resolution(p.text)))
+    for cand in r.candidates:
+        doc = cand.chunk_id.split("::")[0]
+        if len(out) >= limit:
+            break
+        if doc not in seen:
+            seen.add(doc)
+            out.append(DocumentPointer(doc_id=doc, chunk_id=cand.chunk_id, title=cand.title, score=cand.score,
+                                       matched=False, excerpt=cand.excerpt))
+    return out[:limit]
+
+
+def _resolution(text: str, limit: int = 600) -> str:
+    body = text.split("Resolution:", 1)[-1] if "Resolution:" in text else text
+    body = body.split("Notes:", 1)[0]
+    return _excerpt(body, limit)
+
+
+_CATEGORIES = {"readable": "unreadable", "language": "language", "classified": "unclassified", "policy": "policy",
+               "topic": "topic", "documentation": "no_documentation", "confidence": "low_confidence",
+               "consistency": "signals_disagree", "generate": "documentation_incomplete",
+               "guardrail": "guardrail_block"}
+
+
+def _category(check_name: str) -> str:
+    """Why a person is needed, in a few fixed words, for reporting. 'policy', 'topic' and
+    'no_documentation' are genuine needs for a person; 'low_confidence' and 'signals_disagree'
+    are findability problems the system should keep to a minimum."""
+    return _CATEGORIES.get(check_name, check_name)
+
+
+def _team(failed: Check, t: NormalisedTicket, c: Classification) -> str:
+    if failed.name == "topic":
+        found = detect_topics(t.original_text or t.text) or detect_topics(t.text)
+        if found:
+            return TOPICS[next(iter(found))][1]
+    if failed.name == "language":
+        return f"tier1-{t.language}"
+    return SUGGESTED_TEAM.get(c.intent, "tier1")
+
+
 # ------------------------------------------------------------------ the router
 class Router:
     def __init__(self, config: Optional[RoutingConfig] = None):
@@ -231,6 +369,7 @@ class Router:
             Check(name="readable", passed=t.processable,
                   detail="The ticket has readable text." if t.processable
                   else "The ticket has no readable text (it is empty or could not be read)."),
+            self._language_check(t),
             Check(name="classified", passed=not c.is_fallback,
                   detail=f"The system identified the request as {_a(c.intent)} ticket." if not c.is_fallback
                   else f"The system could not work out what the ticket is about ({c.fallback_reason})."),
@@ -238,8 +377,13 @@ class Router:
                   detail=f"{_name(c.intent)} tickets may be answered automatically."
                   if c.intent not in cfg.must_escalate_intents
                   else f"Company policy: {_name(c.intent)} tickets are always handled by a person."),
+            self._topic_check(t),
         ]
-        if top:
+        if top and top.via == "intent_hint":
+            doc_detail = (f"Found the help article '{top.title}' (match score {top.score:.2f}): it scored below the "
+                          f"usual threshold ({r.threshold:.2f}), but it is the article this kind of request needs, "
+                          f"so the classifier and the search agree.")
+        elif top:
             doc_detail = f"Found a matching help article: '{top.title}' (match score {top.score:.2f})."
             if r.degraded:
                 doc_detail += " Search ran in backup mode."
@@ -270,6 +414,30 @@ class Router:
                 else f"The ticket looks like {_a(c.intent)} ticket, but the best article found "
                      f"('{top.title}') is not one used for that kind of request, so the two signals disagree."))
         return checks
+
+    @staticmethod
+    def _language_check(t: NormalisedTicket) -> Check:
+        name = LANGUAGE_NAMES.get(t.language, t.language)
+        if t.language in ("en", "und") or not t.processable:
+            return Check(name="language", passed=None if t.language == "und" else True,
+                         detail="The ticket is in English." if t.language == "en" else "Language not identified.")
+        if t.translated:
+            return Check(name="language", passed=True,
+                         detail=f"The customer wrote in {name}; the ticket was translated into English to be "
+                                f"processed, and any reply goes back in {name} with the English version attached.")
+        return Check(name="language", passed=False,
+                     detail=f"The customer wrote in {name} and the ticket could not be translated, so a person "
+                            f"who reads {name} should handle it.")
+
+    @staticmethod
+    def _topic_check(t: NormalisedTicket) -> Check:
+        found = detect_topics(t.original_text or t.text) or detect_topics(t.text)
+        if not found:
+            return Check(name="topic", passed=True, detail="Nothing in the ticket is on the never-automate list.")
+        name, words = next(iter(found.items()))
+        return Check(name="topic", passed=False,
+                     detail=f"Company policy: not answered automatically because {TOPICS[name][2]} "
+                            f"(the ticket says \"{words}\").")
 
     def _decide(self, t: NormalisedTicket, c: Classification, r: RetrievalResult) -> RoutingDecision:
         checks = self._checks(t, c, r)
@@ -302,32 +470,47 @@ class Router:
         if r.degraded and r.reason:
             uncertainties.append("Documentation search ran in backup mode.")
 
+        documents = _documents(r)
         who = (f"{t.customer_tier.value.capitalize()} customer {t.customer_name or ''} "
                f"({t.customer_id or 'unknown id'})")
-        lang = ", writing in a second language" if t.language_fluency.value == "non_fluent" else ""
+        lang = ""
+        if t.language not in ("en", "und"):
+            lang = f", writing in {LANGUAGE_NAMES.get(t.language, t.language)}"
+        elif t.language_fluency.value == "non_fluent":
+            lang = ", writing in a second language"
         guess = (f"Likely {_a(c.intent)} ticket ({c.intent_confidence:.0%} confidence), urgency {c.urgency}."
                  if not c.is_fallback else "The type of request could not be identified.")
-        good = [s for s in sources if s.above_threshold]
-        if good:
-            docs = "Relevant articles: " + "; ".join(f"{s.title or s.doc_id} [{s.chunk_id}]" for s in good) + "."
-        elif sources:
+        matched = [d for d in documents if d.matched]
+        if matched:
+            docs = "The solution is likely in: " + "; ".join(f"'{d.title}' ({d.doc_id})" for d in matched) + "."
+        elif documents:
             docs = ("No article matched closely enough. Closest: "
-                    + "; ".join(f"{s.title or s.doc_id} [{s.doc_id}, score {s.score:.2f}]" for s in sources) + ".")
+                    + "; ".join(f"'{d.title}' ({d.doc_id}, score {d.score:.2f})" for d in documents) + ".")
         else:
-            docs = "No documentation was found."
+            docs = "No documentation was found: this may be a gap in the knowledge base."
+        said = _excerpt(t.text)
         summary = (f"{' '.join(who.split())} via {t.channel.value.replace('_', ' ')}{lang}. {guess} "
-                   f"Customer wrote: \"{_excerpt(t.text)}\" Escalated because: {failed.detail} {docs}")
+                   f"Customer wrote{' (translated)' if t.translated else ''}: \"{said}\" "
+                   f"Escalated because: {failed.detail} {docs}")
+        thread = list(t.conversation) + [{"role": "customer", "text": t.original_text or t.original_body or t.text,
+                                          "at": t.received_at_raw}]
         return Handoff(
             summary=summary,
-            suggested_team=SUGGESTED_TEAM.get(c.intent, "tier1"),
+            escalation_category=_category(failed.name),
+            suggested_team=_team(failed, t, c),
             priority=PRIORITY.get(c.urgency, "P2"),
             uncertainties=uncertainties,
+            tier1_checks=[ch.model_dump() for ch in checks],
             sources=sources,
+            documents=documents,
             intent_guess=c.intent,
             intent_alternatives=[a.model_dump() for a in c.intent_alternatives[:3]],
             customer={"id": t.customer_id, "name": t.customer_name, "tier": t.customer_tier.value,
                       "region": t.customer_region.value, "language_fluency": t.language_fluency.value},
             channel=t.channel.value,
+            language=t.language,
+            conversation=thread,
+            english_translation=t.text if t.translated else None,
             original_text=t.original_body if t.original_body else t.text,
         )
 
@@ -359,20 +542,19 @@ class Router:
             threshold=self.config.confidence_threshold, sources=[],
             handoff=Handoff(summary=f"Ticket {t.ticket_id} via {t.channel.value}: {detail} "
                                     f"Customer wrote: \"{_excerpt(t.text)}\"",
-                            suggested_team="tier1", priority="P2", uncertainties=[detail], sources=[],
+                            escalation_category="error", suggested_team="tier1", priority="P2",
+                            uncertainties=[detail], tier1_checks=[check.model_dump()], sources=[],
                             intent_guess=intent, intent_alternatives=[], customer={"id": t.customer_id},
-                            channel=t.channel.value, original_text=t.original_body or t.text),
+                            channel=t.channel.value, language=t.language,
+                            conversation=[{"role": "customer", "text": t.original_text or t.text, "at": ""}],
+                            original_text=t.original_body or t.text),
             config_version=self.config.version, inputs_digest="error")
 
 
 # ------------------------------------------------------------------ calibration from data
 def _label_sets(tickets: Sequence[NormalisedTicket]) -> tuple[list[str], dict[str, list[str]]]:
     must = sorted({t.eval_labels["intent"] for t in tickets if t.eval_labels.get("must_not_auto_respond")})
-    docs: dict[str, set] = {}
-    for t in tickets:
-        for d in t.eval_labels.get("expected_doc_ids") or []:
-            docs.setdefault(t.eval_labels["intent"], set()).add(d)
-    return must or list(DEFAULT_MUST_ESCALATE), {k: sorted(v) for k, v in sorted(docs.items())}
+    return must or list(DEFAULT_MUST_ESCALATE), intent_doc_map(tickets)
 
 
 def out_of_fold_classifications(tickets: Sequence[NormalisedTicket],
@@ -392,12 +574,25 @@ def out_of_fold_classifications(tickets: Sequence[NormalisedTicket],
     return out
 
 
+def hint_docs_for(config: RoutingConfig, c: Classification) -> Optional[list[str]]:
+    """The articles intent-guided search may use for this classification, or None when it is off
+    or the classifier is not confident enough for its intent to guide the search."""
+    if not config.use_intent_hint or c.is_fallback or c.intent_confidence < config.confidence_threshold:
+        return None
+    return config.intent_docs.get(c.intent) or None
+
+
 def replay(records: Sequence[dict], threshold: float, config: RoutingConfig) -> dict:
-    """Outcome rates for one threshold over pre-computed (ticket, classification, retrieval) records."""
-    router = Router(config.model_copy(update={"confidence_threshold": threshold}))
+    """Outcome rates for one threshold over pre-computed (ticket, classification, retrieval) records.
+    Records may carry `retrieval_hint` (the result with intent-guided search), used when the config
+    switches it on and the classification clears the threshold."""
+    cfg = config.model_copy(update={"confidence_threshold": threshold})
+    router = Router(cfg)
     auto = wrong = missed = 0
     for rec in records:
-        t, c, r = rec["ticket"], rec["classification"], rec["retrieval"]
+        t, c = rec["ticket"], rec["classification"]
+        r = rec.get("retrieval_hint") if (rec.get("retrieval_hint") is not None and hint_docs_for(cfg, c)) \
+            else rec["retrieval"]
         action = router._decide(t, c, r).action
         labels = t.eval_labels
         if action == "auto_respond":
@@ -427,14 +622,29 @@ def calibrate(tickets: Iterable[Any], retriever: Any, cost_ratio: Optional[float
     must, intent_docs = _label_sets(rows)
     base = RoutingConfig(cost_ratio=cost_ratio, must_escalate_intents=must, intent_docs=intent_docs)
     retrievals = {t.ticket_id: retriever.retrieve(t) for t in rows}
-    records = [{"ticket": rows[i], "classification": c, "retrieval": retrievals[rows[i].ticket_id]}
-               for i, c in out_of_fold_classifications(rows)]
-    curve = [replay(records, th, base) for th in THRESHOLD_GRID]
-    best = choose_threshold(curve, cost_ratio)
+    records = []
+    for i, c in out_of_fold_classifications(rows):
+        t = rows[i]
+        plain = retrievals[t.ticket_id]
+        hint = None
+        if not plain.passages and not c.is_fallback and intent_docs.get(c.intent):
+            hint = retriever.retrieve(t, hint_docs=intent_docs[c.intent])
+        records.append({"ticket": t, "classification": c, "retrieval": plain, "retrieval_hint": hint})
+    # two curves: without and with intent-guided search; keep whichever costs less (ties: without)
+    curves = {flag: [replay(records, th, base.model_copy(update={"use_intent_hint": flag})) for th in THRESHOLD_GRID]
+              for flag in (False, True)}
+    picks = {flag: choose_threshold(curves[flag], cost_ratio) for flag in (False, True)}
+    data_choice = picks[True]["cost"] < picks[False]["cost"]
+    mode = os.getenv("INTENT_HINT", "on").strip().lower()      # on | off | auto (follow the data)
+    use_hint = data_choice if mode == "auto" else mode != "off"
+    curve, best = curves[use_hint], picks[use_hint]
     sensitivity = {f"{r:g}": choose_threshold(curve, r)["threshold"] for r in SENSITIVITY_RATIOS}
     cfg = base.model_copy(update={"confidence_threshold": best["threshold"], "calibrated": True,
                                   "calibrated_on": len(rows), "curve": curve, "sensitivity": sensitivity,
-                                  "chosen": best})
+                                  "chosen": best, "use_intent_hint": use_hint,
+                                  "hint_comparison": {"without": picks[False], "with": picks[True],
+                                                      "lower_cost_at_this_ratio": "with" if data_choice else "without",
+                                                      "setting": mode}})
     cfg.save(config_path)
     return cfg
 
@@ -444,7 +654,8 @@ def run_chain(tickets: Iterable[Any], classifier: Classifier, retriever: Any, ro
     out = []
     for raw in tickets:
         t = raw if isinstance(raw, NormalisedTicket) else normalise_ticket(raw)
-        out.append(router.decide(t, classifier.classify(t), retriever.retrieve(t)))
+        c = classifier.classify(t)
+        out.append(router.decide(t, c, retriever.retrieve(t, hint_docs=hint_docs_for(router.config, c))))
     return out
 
 
@@ -492,7 +703,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             cfg = calibrate(load_tickets(args.tickets), build_retriever(), args.cost_ratio, args.config)
             print(json.dumps({"confidence_threshold": cfg.confidence_threshold, "cost_ratio": cfg.cost_ratio,
                               "chosen": cfg.chosen, "threshold_by_cost_ratio": cfg.sensitivity,
-                              "must_escalate_intents": cfg.must_escalate_intents}, indent=2))
+                              "must_escalate_intents": cfg.must_escalate_intents,
+                              "use_intent_hint": cfg.use_intent_hint, "hint_comparison": cfg.hint_comparison},
+                             indent=2))
             return 0
         tickets = load_tickets(args.input)
         decisions = run_chain(tickets, load_or_train(), build_retriever(), Router(RoutingConfig.load(args.config)))

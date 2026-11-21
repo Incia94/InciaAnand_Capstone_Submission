@@ -12,17 +12,34 @@ Usage (run from the project root, after `python -m src.ingest docs`)
     python -m src.retrieve search "my api key suddenly returns 401"
     python -m src.retrieve calibrate                       # sets thresholds from development tickets
     python -m src.retrieve evaluate --tickets data/validation_tickets.json
-    python -m src.retrieve compare --backend dense         # chunking strategies, real embeddings
+    python -m src.retrieve compare --backend hybrid        # chunking strategies, real embeddings + words
+    python -m src.retrieve compare --backend dense         # chunking strategies, embeddings only
     python -m src.retrieve compare --backend lexical       # same, word matching (no model needed)
 
-Backends
+Backends (RETRIEVAL_BACKEND)
 --------
-dense    all-MiniLM-L6-v2 embeddings in Chroma (built by `python -m src.ingest docs`). Primary.
+hybrid   the default. Meaning (dense embeddings) and exact wording (lexical) combined: every
+         article gets HYBRID_DENSE_WEIGHT x dense score + the rest x lexical score (0.7 / 0.3 by
+         default). Dense search finds a passage when the customer uses different words from the
+         article ("can't get in" for "sign-in fails"); lexical search keeps exact terms such as
+         error codes, product names and "429" from being lost. Neither alone is relied on.
+dense    all-MiniLM-L6-v2 embeddings in Chroma only (built by `python -m src.ingest docs`).
 lexical  TF-IDF over words and character n-grams, built in memory from documentation.json.
          Needs no model and no network, so it is the fallback when the dense path fails
          (acceptance criterion A11). Results then carry degraded=True and the reason.
-Scores are cosine similarities (0-1). The two backends score on different scales, so each has
-its own threshold.
+The backends score on different scales, so each has its own threshold.
+
+Intent-guided search (findability)
+----------------------------------
+Many tickets that a person could answer from the documentation are escalated only because the
+best passage scores just under the threshold: the customer described the problem in words the
+article does not use. When the classifier is confident about the intent, `retrieve(hint_docs=...)`
+is given the articles that tickets of that intent have needed before. If none of the normal
+results passes the threshold but one of those articles is among the candidates and scores above
+a second, lower threshold (the hint threshold, also calibrated from the development tickets),
+that article is returned, marked via="intent_hint". Two independent signals then agree, and the
+guardrails still check every claim against the article before anything is sent. Routing decides
+from data whether this is switched on (storage/routing.json: use_intent_hint).
 
 The threshold
 -------------
@@ -69,7 +86,9 @@ DEFAULT_CONFIG = "./storage/retrieval.json"
 DEFAULT_TRAIN = "./data/development_tickets.json"
 DEFAULT_K = 5
 # Used only until `calibrate` has run (and written storage/retrieval.json).
-FALLBACK_THRESHOLDS = {"dense": 0.45, "lexical": 0.20}
+FALLBACK_THRESHOLDS = {"dense": 0.45, "lexical": 0.20, "hybrid": 0.38}
+HINT_FACTOR = 0.6                 # hint threshold = 0.6 x threshold until calibrate has run
+DEFAULT_HYBRID_WEIGHT = 0.7
 
 
 # ------------------------------------------------------------------ output
@@ -81,12 +100,14 @@ class Passage(BaseModel):
     section: str
     score: float
     text: str
+    via: str = "search"    # "search": passed the relevance threshold; "intent_hint": see module notes
 
 
 class Candidate(BaseModel):
     chunk_id: str
     score: float
     title: str = ""
+    excerpt: str = ""      # the start of the passage, so a person can see what it says
 
 
 class RetrievalResult(BaseModel):
@@ -98,6 +119,7 @@ class RetrievalResult(BaseModel):
     threshold: float = 0.0
     backend: str = ""
     degraded: bool = False              # True when the primary backend failed and lexical answered
+    hinted: bool = False                # True when the passage came from intent-guided search
     reason: str = ""
     latency_ms: float = 0.0
 
@@ -188,8 +210,25 @@ class ChromaSearch:
         self.embed = embed
 
     def search(self, text: str, k: int) -> Hits:
+        k = min(k, self.collection.count())
         res = self.collection.query(query_embeddings=self.embed([text]), n_results=k, include=["distances"])
         return [(cid, float(1.0 - d)) for cid, d in zip(res["ids"][0], res["distances"][0])]
+
+
+class HybridSearch:
+    """Dense and lexical scores combined for every passage. The corpus is small (one passage per
+    article), so both backends score all of it and nothing is missed by either one's cut-off."""
+    name = "hybrid"
+
+    def __init__(self, dense: Any, lexical: LexicalSearch, n_chunks: int, weight: float = DEFAULT_HYBRID_WEIGHT):
+        self.dense, self.lexical, self.n, self.weight = dense, lexical, n_chunks, float(weight)
+
+    def search(self, text: str, k: int) -> Hits:
+        dense = dict(self.dense.search(text, self.n))          # raises if dense fails -> lexical fallback
+        lexical = dict(self.lexical.search(text, self.n))
+        ids = set(dense) | set(lexical)
+        scores = {cid: self.weight * dense.get(cid, 0.0) + (1 - self.weight) * lexical.get(cid, 0.0) for cid in ids}
+        return sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))[:k]
 
 
 # ------------------------------------------------------------------ the retriever
@@ -203,16 +242,33 @@ class Retriever:
         self.k = k
         self.primary_error = primary_error
 
-    def retrieve(self, ticket: Any, k: Optional[int] = None) -> RetrievalResult:
-        """Never raises. Returns passages above the threshold, best first, or none."""
+    def retrieve(self, ticket: Any, k: Optional[int] = None,
+                 hint_docs: Optional[Sequence[str]] = None) -> RetrievalResult:
+        """Never raises. Returns passages above the threshold, best first, or none. With hint_docs
+        (the articles the ticket's intent has needed before), a near miss from one of those
+        articles is returned when it clears the lower hint threshold (see module notes)."""
         started = time.perf_counter()
         k = k or self.k
         ticket_id, text = _query_of(ticket)
-        result = self._retrieve(ticket_id, text, k)
+        result = self._retrieve(ticket_id, text, k, set(hint_docs or ()))
         result.latency_ms = round((time.perf_counter() - started) * 1000, 2)
         return result
 
-    def _retrieve(self, ticket_id: str, text: str, k: int) -> RetrievalResult:
+    def hint_threshold(self, backend: str) -> float:
+        key = f"{backend}_hint"
+        return float(self.thresholds.get(key, HINT_FACTOR * self.thresholds.get(backend, FALLBACK_THRESHOLDS[backend])))
+
+    def passages_for(self, refs: Sequence[tuple[str, float]], via: str = "search") -> list[Passage]:
+        """Passages for given (chunk_id, score) pairs, e.g. near misses offered to an agent."""
+        out = []
+        for cid, score in refs:
+            c = self.corpus.resolve(cid)
+            if c is not None:
+                out.append(Passage(rank=len(out) + 1, chunk_id=cid, doc_id=c.doc_id, title=c.metadata.get("title", ""),
+                                   section=c.section, score=round(score, 4), text=c.text, via=via))
+        return out
+
+    def _retrieve(self, ticket_id: str, text: str, k: int, hint_docs: Optional[set] = None) -> RetrievalResult:
         if not text.strip():
             return RetrievalResult(ticket_id=ticket_id, status="empty_query", reason="ticket has no usable text")
         backend, degraded, reason = self.primary, False, ""
@@ -221,12 +277,12 @@ class Retriever:
             reason = self.primary_error or "no dense index configured; lexical search used"
         hits: Hits = []
         try:
-            hits = backend.search(text, max(k, DEFAULT_K))
+            hits = backend.search(text, len(self.corpus.chunks) if hint_docs else max(k, DEFAULT_K))
         except Exception as exc:
             log.warning("%s search failed (%s); using lexical fallback", backend.name, exc)
             backend, degraded, reason = self.fallback, True, f"{backend.name} failed: {type(exc).__name__}: {exc}"
             try:
-                hits = backend.search(text, max(k, DEFAULT_K))
+                hits = backend.search(text, len(self.corpus.chunks) if hint_docs else max(k, DEFAULT_K))
             except Exception as exc2:  # nothing left to try
                 return RetrievalResult(ticket_id=ticket_id, status="unavailable", degraded=True,
                                        reason=f"{reason}; lexical failed: {exc2}")
@@ -244,6 +300,16 @@ class Retriever:
             passages.append(Passage(rank=len(passages) + 1, chunk_id=cid, doc_id=c.doc_id,
                                     title=c.metadata.get("title", ""), section=c.section,
                                     score=round(score, 4), text=c.text))
+        hinted = False
+        if not passages and hint_docs:
+            hint_th = self.hint_threshold(backend.name)
+            near = next(((cid, sc) for cid, sc in verified if self.corpus.resolve(cid).doc_id in hint_docs), None)
+            if near and near[1] >= hint_th:
+                passages = self.passages_for([near], via="intent_hint")
+                hinted = True
+                reason = (reason + "; " if reason else "") + (
+                    f"no passage passed the {threshold:.3f} threshold; {near[0]} ({near[1]:.3f}) is an article this "
+                    f"kind of ticket normally needs and passed the {hint_th:.3f} intent-guided threshold")
         status = "ok" if passages else "no_relevant_passage"
         if not passages:
             reason = (reason + "; " if reason else "") + (
@@ -252,10 +318,18 @@ class Retriever:
         return RetrievalResult(
             ticket_id=ticket_id, status=status, passages=passages,
             candidates=[Candidate(chunk_id=c, score=round(s, 4),
-                                  title=self.corpus.resolve(c).metadata.get("title", ""))
+                                  title=self.corpus.resolve(c).metadata.get("title", ""),
+                                  excerpt=_excerpt_of(self.corpus.resolve(c).text))
                         for c, s in verified[:max(k, DEFAULT_K)]],
             top_score=round(top, 4), threshold=round(threshold, 4), backend=backend.name,
-            degraded=degraded, reason=reason)
+            degraded=degraded, hinted=hinted, reason=reason)
+
+
+def _excerpt_of(text: str, limit: int = 400) -> str:
+    """The part of an article that holds the fix, if it is marked, else its opening."""
+    body = text.split("Resolution:", 1)[-1] if "Resolution:" in text else text
+    body = " ".join(body.split())
+    return body if len(body) <= limit else body[:limit].rsplit(" ", 1)[0] + "…"
 
 
 def _query_of(ticket: Any) -> tuple[str, str]:
@@ -309,6 +383,39 @@ def score_tickets(search: Any, corpus: Corpus, tickets: Sequence[NormalisedTicke
                     "top_text": corpus.resolve(hits[0][0]).text if hits else "",
                     "top3_text": " ".join(corpus.resolve(c).text for c, _ in hits[:3]),
                     "answerable": bool(expected)})
+    return out
+
+
+def intent_doc_map(tickets: Sequence[NormalisedTicket]) -> dict[str, list[str]]:
+    """Intent -> the documents its labelled tickets were answered from."""
+    docs: dict[str, set] = {}
+    for t in tickets:
+        for d in t.eval_labels.get("expected_doc_ids") or []:
+            docs.setdefault(t.eval_labels["intent"], set()).add(d)
+    return {k: sorted(v) for k, v in sorted(docs.items())}
+
+
+def hint_rows(search: Any, corpus: Corpus, tickets: Sequence[NormalisedTicket],
+              intent_docs: dict[str, list[str]], no_doc: Optional[set[str]] = None) -> list[dict]:
+    """Like score_tickets, but the 'top' passage is the best-scoring one from the articles the
+    ticket's intent has needed: what intent-guided search would return. Used to fit its threshold."""
+    no_doc = no_doc_intents(tickets) if no_doc is None else no_doc
+    out = []
+    for t in tickets:
+        hint = set(intent_docs.get(t.eval_labels.get("intent", ""), []))
+        if not hint:
+            continue
+        expected = set(t.eval_labels.get("expected_doc_ids") or [])
+        hits = [(cid, s) for cid, s in search.search(t.text, len(corpus.chunks)) if corpus.resolve(cid)]
+        best = next(((cid, s) for cid, s in hits if corpus.resolve(cid).doc_id in hint), None)
+        if best is None:
+            continue
+        correct = corpus.resolve(best[0]).doc_id in expected
+        group = ("relevant" if correct else "wrong") if expected else (
+            "no_doc" if t.eval_labels.get("intent") in no_doc else "ambiguous")
+        out.append({"ticket_id": t.ticket_id, "top_score": best[1], "top_correct": correct, "group": group,
+                    "first_correct_rank": 1 if correct else None, "answerable": bool(expected),
+                    "top_text": "", "top3_text": ""})
     return out
 
 
@@ -400,6 +507,9 @@ def compare_strategies(docs_path: Path, train: Sequence[NormalisedTicket], backe
     for strategy in strategies:
         corpus = Corpus.from_file(docs_path, strategy)
         search = LexicalSearch(corpus) if backend == "lexical" else InMemoryDenseSearch(corpus, embed)
+        if backend == "hybrid":
+            search = HybridSearch(search, LexicalSearch(corpus), len(corpus.chunks),
+                                  float(os.getenv("HYBRID_DENSE_WEIGHT", DEFAULT_HYBRID_WEIGHT)))
         rows = score_tickets(search, corpus, train, no_doc=no_doc)
         th = best_threshold(rows)
         entry = {"chunks": len(corpus.chunks),
@@ -433,21 +543,26 @@ def build_retriever(docs_path: Optional[Path] = None, persist_dir: Optional[Path
     docs_path = Path(docs_path or os.getenv("DOCS_PATH", DEFAULT_DOCS))
     persist_dir = Path(persist_dir or os.getenv("CHROMA_PATH", DEFAULT_CHROMA))
     config_path = Path(config_path or os.getenv("RETRIEVAL_CONFIG", DEFAULT_CONFIG))
-    backend = backend or os.getenv("RETRIEVAL_BACKEND", "dense")
+    backend = backend or os.getenv("RETRIEVAL_BACKEND", "hybrid")
     config = _read_json(config_path)
     report = _read_json(persist_dir / "ingest_report.json")
     strategy = report.get("strategy") or config.get("strategy") or os.getenv("CHUNK_STRATEGY", DEFAULT_STRATEGY)
     corpus = Corpus.from_file(docs_path, strategy)
 
     primary, error = None, ""
-    if backend == "dense":
+    lexical = LexicalSearch(corpus)
+    if backend in ("dense", "hybrid"):
         try:
             embed = embed or _embedder(report.get("embedding_model") or os.getenv("EMBEDDING_MODEL", DEFAULT_MODEL))
             primary = ChromaSearch(persist_dir, os.getenv("CHROMA_COLLECTION", DEFAULT_COLLECTION), embed)
+            if backend == "hybrid":
+                primary = HybridSearch(primary, lexical, len(corpus.chunks),
+                                       float(os.getenv("HYBRID_DENSE_WEIGHT", DEFAULT_HYBRID_WEIGHT)))
         except Exception as exc:
-            error = f"dense unavailable: {type(exc).__name__}: {exc}"
+            error = f"{backend} unavailable (no dense index): {type(exc).__name__}: {exc}"
             log.warning("%s; retrieval will use lexical search", error)
-    retriever = Retriever(corpus, primary=primary, thresholds=config.get("thresholds"), primary_error=error)
+    retriever = Retriever(corpus, primary=primary, fallback=lexical, thresholds=config.get("thresholds"),
+                          primary_error=error)
     if not config.get("thresholds"):
         log.warning("no %s yet: using default thresholds; run `python -m src.retrieve calibrate`", config_path)
     return retriever
@@ -457,12 +572,20 @@ def calibrate(retriever: Retriever, tickets: Sequence[NormalisedTicket], config_
     """Choose a threshold per available backend from labelled tickets and save it."""
     out = {"strategy": retriever.corpus.strategy, "calibrated_on": len(tickets), "thresholds": {}, "metrics": {}}
     backends = [b for b in (retriever.primary, retriever.fallback) if b is not None]
+    intent_docs = intent_doc_map(tickets)
     for b in backends:
         rows = score_tickets(b, retriever.corpus, tickets)
         th = best_threshold(rows)
         out.setdefault("ambiguous_excluded", sum(r["group"] == "ambiguous" for r in rows))
         out["thresholds"][b.name] = round(th, 4)
         out["metrics"][b.name] = {**metrics(rows, th), **cross_fitted_metrics(rows)}
+        # intent-guided threshold: only the near misses matter, so fit it on tickets below th
+        hrows = [r for r in hint_rows(b, retriever.corpus, tickets, intent_docs) if r["top_score"] < th]
+        hth = best_threshold(hrows) if hrows else HINT_FACTOR * th
+        out["thresholds"][f"{b.name}_hint"] = round(min(hth, th), 4)
+        out["metrics"][f"{b.name}_hint"] = {"near_misses": len(hrows),
+                                            "right_article": sum(r["top_correct"] for r in hrows),
+                                            **cross_fitted_metrics(hrows)}
     retriever.thresholds.update(out["thresholds"])
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(json.dumps(out, indent=2))
@@ -486,7 +609,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p = argparse.ArgumentParser(prog="python -m src.retrieve", description="Search the documentation.")
     p.add_argument("--docs", type=Path, default=Path(os.getenv("DOCS_PATH", DEFAULT_DOCS)))
     p.add_argument("--config", type=Path, default=Path(os.getenv("RETRIEVAL_CONFIG", DEFAULT_CONFIG)))
-    p.add_argument("--backend", choices=["dense", "lexical"], default=os.getenv("RETRIEVAL_BACKEND", "dense"))
+    p.add_argument("--backend", choices=["hybrid", "dense", "lexical"],
+                   default=os.getenv("RETRIEVAL_BACKEND", "hybrid"))
     sub = p.add_subparsers(dest="command", required=True)
     s = sub.add_parser("search", help="search for one query")
     s.add_argument("query")
@@ -500,12 +624,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     cmp.add_argument("--validation", type=Path, default=Path("./data/validation_tickets.json"))
     cmp.add_argument("--truth", type=Path, default=Path("./data/ground_truth_responses.json"))
     cmp.add_argument("--output", type=Path, default=Path("./storage/chunking_comparison.json"))
+    # --backend also works after the command (python -m src.retrieve compare --backend dense);
+    # SUPPRESS keeps the value given before the command when it is not repeated after it.
+    for sp in (s, c, e, cmp):
+        sp.add_argument("--backend", choices=["hybrid", "dense", "lexical"], default=argparse.SUPPRESS)
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
     try:
         if args.command == "compare":
-            embed = _embedder(os.getenv("EMBEDDING_MODEL", DEFAULT_MODEL)) if args.backend == "dense" else None
+            embed = (_embedder(os.getenv("EMBEDDING_MODEL", DEFAULT_MODEL)) if args.backend in ("dense", "hybrid")
+                     else None)
             val = _labelled(load_tickets(args.validation)) if args.validation.is_file() else None
             truth = {g["ticket_id"]: g for g in json.loads(args.truth.read_text())} if args.truth.is_file() else None
             report = compare_strategies(args.docs, _labelled(load_tickets(args.tickets)), args.backend, embed, val,
@@ -524,7 +653,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             out = {}
             for b in [x for x in (retriever.primary, retriever.fallback) if x is not None]:
                 rows = score_tickets(b, retriever.corpus, tickets)
-                out[b.name] = metrics(rows, retriever.thresholds.get(b.name, FALLBACK_THRESHOLDS[b.name]))
+                out[b.name] = metrics(rows, retriever.thresholds.get(b.name, FALLBACK_THRESHOLDS.get(b.name, 0.4)))
             print(json.dumps(out, indent=2))
     except Exception as exc:
         log.error("%s failed: %s", args.command, exc)
@@ -547,5 +676,3 @@ def _print_comparison(report: dict) -> None:
 
 if __name__ == "__main__":
     sys.exit(main())
-
-

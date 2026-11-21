@@ -238,7 +238,7 @@ def test_req3_guardrails_crash_still_blocks(store):
 def test_req4_every_check_recorded_even_when_released(guards):
     res = guards.check(TICKET, answer(), RETRIEVAL)
     assert [c.name for c in res.checks] == ["structure", "private_data", "claim_support", "forbidden_claims",
-                                            "secret_request", "injection", "tone"]
+                                            "secret_request", "injection", "tone", "translation"]
     support = next(c for c in res.checks if c.name == "claim_support").stats
     assert support["claims"] == 3 and len(support["scores"]) == 3 and support["threshold"] == 0.45
     assert res.answer_digest and res.checked_at and res.generator == "llm" and res.prompt_version

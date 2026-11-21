@@ -82,7 +82,8 @@ def prepare(train_path: Path, say: Callable[[str], None]) -> list[str]:
     from src.ingest import load_tickets
     done = []
     chroma = Path(os.getenv("CHROMA_PATH", "./storage/chroma"))
-    if os.getenv("RETRIEVAL_BACKEND", "dense") == "dense" and not (chroma / "ingest_report.json").is_file():
+    needs_index = os.getenv("RETRIEVAL_BACKEND", "hybrid") in ("dense", "hybrid")
+    if needs_index and not (chroma / "ingest_report.json").is_file():
         say(f"preparing: building the documentation index in {chroma}")
         try:
             ingest.ingest_docs(Path(os.getenv("DOCS_PATH", "./data/documentation.json")), chroma,
@@ -141,6 +142,13 @@ def ticket_row(state: dict, corpus: Any) -> dict:
         "latency_ms": o.latency_ms, "degraded": list(o.degraded), "error": state.get("error"),
         "labels": labels or None, "history": t.eval_history or None,
         "reply": o.reply, "handoff_summary": (o.handoff or {}).get("summary"),
+        "escalation_category": (o.handoff or {}).get("escalation_category"),
+        "suggested_team": (o.handoff or {}).get("suggested_team"),
+        "draft_status": (o.draft_reply or {}).get("status"),
+        "draft_guardrail_passed": (o.draft_reply or {}).get("guardrail_passed"),
+        "draft_sources": [s_["doc_id"] for s_ in (o.draft_reply or {}).get("sources", [])],
+        "language": t.language, "translated": t.translated, "reply_language": a.reply_language if a else None,
+        "intent_hint_used": bool(r and r.hinted),
     }
 
 
@@ -179,6 +187,33 @@ def compute_metrics(rows: list[dict], reconcile: dict) -> dict:
     lab = [r for r in rows if r["labels"]]
     lat_all = [r["latency_ms"] / 1000 for r in rows]
     lat_sent = [r["latency_ms"] / 1000 for r in sent]
+
+    # Why tickets were escalated. Against the labels, an escalation is "genuine" when the label
+    # says a person is needed, and "avoidable" (a findability problem) when the label says it could
+    # have been answered automatically from the documentation.
+    esc_lab = [r for r in esc if r["labels"]]
+    avoidable = [r for r in esc_lab if r["labels"].get("expected_route") == "auto_respond"
+                 and r["labels"].get("expected_doc_ids")]
+    escalations = {
+        "by_category": dict(Counter(r["escalation_category"] or r["decided_by"] for r in esc).most_common()),
+        "by_team": dict(Counter(r["suggested_team"] or "unknown" for r in esc).most_common()),
+        "labelled_escalations": len(esc_lab),
+        "genuine": sum(r["labels"].get("expected_route") == "escalate" for r in esc_lab),
+        "avoidable_findability": len(avoidable),
+        "avoidable_share_of_escalations": _rate(len(avoidable), len(esc_lab)),
+        "avoidable_by_category": dict(Counter(r["escalation_category"] or r["decided_by"]
+                                              for r in avoidable).most_common()),
+        "note": "genuine = labelled escalate; avoidable = labelled auto_respond with a documented answer.",
+        "intent_hint_answers": sum(r["intent_hint_used"] and r["outcome"] == "sent" for r in rows),
+        "drafts_for_agents": sum(r["draft_status"] == "drafted" for r in esc),
+        "drafts_passing_guardrails": sum(r["draft_status"] == "drafted" and bool(r["draft_guardrail_passed"])
+                                         for r in esc),
+        "escalations_without_draft": sum(r["draft_status"] != "drafted" for r in esc),
+    }
+    languages = {"by_language": dict(Counter(r["language"] for r in rows)),
+                 "translated": sum(r["translated"] for r in rows),
+                 "replies_in_customer_language": sum(r["outcome"] == "sent" and r["reply_language"] not in
+                                                     (None, "en") for r in rows)}
 
     volume = {
         "tickets_processed": n, "answered_automatically": len(sent), "escalated": len(esc),
@@ -304,7 +339,7 @@ def compute_metrics(rows: list[dict], reconcile: dict) -> dict:
                                           "==": value == goal}[op]
         targets.append({"target": label, "metric": key, "value": value, "goal": f"{op} {goal}", "met": met})
     return {"volume": volume, "business": business, "technical": technical, "governance": governance,
-            "targets": targets}
+            "escalations": escalations, "languages": languages, "targets": targets}
 
 
 def fairness(rows: list[dict]) -> dict:
@@ -368,6 +403,23 @@ def render_markdown(report: dict) -> str:
               "unprocessable_input", "tickets_with_labels"):
         lines.append(f"| {k.replace('_', ' ')} | {v[k]} |")
     lines.append(f"| escalated by | {', '.join(f'{k} {n}' for k, n in v['escalated_by'].items()) or 'none'} |")
+    e = m.get("escalations", {})
+    if e:
+        lines += ["", "## Escalations: genuine or avoidable", "", "| | |", "|---|---|",
+                  f"| escalated tickets with labels | {e['labelled_escalations']} |",
+                  f"| genuine (labelled escalate) | {e['genuine']} |",
+                  f"| avoidable: findability (labelled auto_respond, documented) | {e['avoidable_findability']} |",
+                  f"| avoidable share of escalations | {_fmt(e['avoidable_share_of_escalations'], 'rate')} |",
+                  f"| by category | {e['by_category'] or 'none'} |",
+                  f"| avoidable, by category | {e['avoidable_by_category'] or 'none'} |",
+                  f"| by suggested team | {e['by_team'] or 'none'} |",
+                  f"| answered through intent-guided search | {e['intent_hint_answers']} |",
+                  f"| escalations with a cited draft for the agent | {e['drafts_for_agents']} "
+                  f"({e['drafts_passing_guardrails']} passed every guardrail) |",
+                  "", f"- {e['note']}"]
+        lg = m["languages"]
+        lines += [f"- Languages: {lg['by_language']}; translated {lg['translated']}; replies in the customer's "
+                  f"language {lg['replies_in_customer_language']}."]
     lines += ["", "## Business outcomes", "", "| Measure | This run | Baseline (history) |", "|---|---|---|"]
     base = b["baseline_from_history"] or {}
     lines += [f"| First contact resolution | {_fmt(b['first_contact_resolution'], 'rate')} | "
@@ -545,6 +597,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--truth", type=Path, default=Path(DEFAULT_TRUTH), help="reference answers for the judge")
     args = p.parse_args(argv)
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "WARNING"), format="%(levelname)s %(name)s: %(message)s")
+    for noisy in ("httpx", "httpx2", "httpcore", "huggingface_hub", "sentence_transformers", "chromadb", "urllib3",
+                  "torch", "openai"):   # library chatter; the harness prints its own progress
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     if not args.input.is_file():
         print(f"input file not found: {args.input}", file=sys.stderr)
         return 1

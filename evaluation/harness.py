@@ -54,7 +54,9 @@ DEFAULT_TRAIN = "./data/development_tickets.json"
 DEFAULT_TRUTH = "./data/ground_truth_responses.json"
 PII_KINDS = {"email", "ip_address", "customer_id", "api_key", "aws_key", "github_token", "jwt",
              "secret_assignment", "long_token", "phone_number", "payment_card"}
-SEGMENTS = ("customer_tier", "customer_region", "language_fluency", "channel")
+SEGMENTS = ("customer_tier", "customer_region", "language_fluency", "channel", "ticket_length")
+# Ticket length bands from the quartiles of the 580 labelled tickets (24 and 32 words).
+SHORT_WORDS, LONG_WORDS = 25, 33
 FAIRNESS_GAP = 0.05          # Brief: under five percentage points between groups
 FAIRNESS_MIN_N = 10          # smaller segments are reported but not judged
 
@@ -142,6 +144,8 @@ def ticket_row(state: dict, corpus: Any) -> dict:
         "latency_ms": o.latency_ms, "degraded": list(o.degraded), "error": state.get("error"),
         "labels": labels or None, "history": t.eval_history or None,
         "reply": o.reply, "handoff_summary": (o.handoff or {}).get("summary"),
+        "ticket_length": ("short (under 25 words)" if t.word_count < SHORT_WORDS
+                          else "long (over 32 words)" if t.word_count >= LONG_WORDS else "medium (25 to 32 words)"),
         "escalation_category": (o.handoff or {}).get("escalation_category"),
         "suggested_team": (o.handoff or {}).get("suggested_team"),
         "draft_status": (o.draft_reply or {}).get("status"),
@@ -352,9 +356,11 @@ def fairness(rows: list[dict]) -> dict:
         table = {}
         for g, rs in sorted(groups.items()):
             lab = [r for r in rs if r["labels"]]
+            judged = [r["judge"]["rating"] for r in rs if (r.get("judge") or {}).get("judged")]
             table[g] = {"tickets": len(rs), "auto_rate": _rate(sum(r["outcome"] == "sent" for r in rs), len(rs)),
                         "correct_automatic_resolution": _rate(sum(bool(_correct_answer(r)) for r in lab), len(lab)),
-                        "escalation_rate": _rate(sum(r["outcome"] == "escalated" for r in rs), len(rs))}
+                        "escalation_rate": _rate(sum(r["outcome"] == "escalated" for r in rs), len(rs)),
+                        "judge_rating": round(statistics.mean(judged), 2) if judged else None}
         gaps = {}
         for metric in ("auto_rate", "correct_automatic_resolution", "escalation_rate"):
             vals = [v[metric] for v in table.values() if v[metric] is not None and v["tickets"] >= FAIRNESS_MIN_N]
@@ -455,7 +461,34 @@ def render_markdown(report: dict) -> str:
               "must_not_auto_respond_answered_automatically", "fairness_max_gap"):
         lines.append(f"| {k.replace('_', ' ')} | {_fmt(g[k], k)} |")
     lines.append(f"| guardrail activations by type | {g['guardrail_activations_by_type'] or 'none'} |")
-    lines += ["", "### Fairness by customer group", ""]
+    lines += ["", "### Fairness audit (Governance Framework format)", "",
+              "Resolution rate = answered automatically. Quality score = correct automatic resolution (sent, right "
+              "intent, an expected article cited, labelled auto_respond); with --judge, the mean model-judged "
+              "rating is shown too. Variation from best = best group's quality score minus this group's. "
+              f"Groups under {FAIRNESS_MIN_N} tickets are listed but not used for the gap.", "",
+              "| Segment | Tickets in segment | Resolution rate | Quality score | Variation from best | Explanation |",
+              "|---|---|---|---|---|---|"]
+    fw = [("customer_tier", "enterprise", "Enterprise customers"), ("customer_tier", "business", "Business customers"),
+          ("customer_tier", "standard", "Standard customers"),
+          ("language_fluency", "fluent", "Tickets in fluent English"),
+          ("language_fluency", "non_fluent", "Tickets in non-fluent English"),
+          ("ticket_length", "short (under 25 words)", "Short tickets (under 25 words)"),
+          ("ticket_length", "long (over 32 words)", "Long tickets (over 32 words)")]
+    for dim, grp, label in fw:
+        d_ = g["fairness"].get(dim, {}).get("groups", {})
+        row = d_.get(grp)
+        if not row:
+            lines.append(f"| {label} | 0 | n/a | n/a | n/a | |")
+            continue
+        best = max((v["correct_automatic_resolution"] for v in d_.values()
+                    if v["correct_automatic_resolution"] is not None and v["tickets"] >= FAIRNESS_MIN_N), default=None)
+        q = row["correct_automatic_resolution"]
+        var = None if (best is None or q is None) else round(best - q, 4)
+        judge = f" (judged {row['judge_rating']})" if row.get("judge_rating") is not None else ""
+        lines.append(f"| {label} | {row['tickets']} | {_fmt(row['auto_rate'], 'rate')} | {_fmt(q, 'rate')}{judge} | "
+                     f"{_fmt(var, 'gap')} | |")
+    lines += ["", "The Explanation column is for your interpretation in the report.", "",
+              "### Fairness by customer group", ""]
     for dim, d in g["fairness"].items():
         lines += [f"**{dim}**", "", "| Group | Tickets | Auto rate | Correct auto | Escalation |",
                   "|---|---|---|---|---|"]

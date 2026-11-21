@@ -82,6 +82,12 @@ MAX_ATTEMPTS = 2                      # first try + one repair
 
 OPENING = "Thanks for getting in touch."
 CLOSING = "If this does not resolve it, reply to this message and a member of the team will pick it up."
+# Customers asked to know when a reply is automated, so they can decide how much to verify it.
+AUTOMATED_NOTE = "This reply was prepared automatically from the CloudServe help articles listed below."
+# The prompt register (Stage 3) ids, so the decision log can name the prompt as PR-xx vN.
+PROMPT_IDS = {"generate_answer": "PR-01", "generate_answer_user": "PR-02", "repair_reply": "PR-03",
+              "translate_ticket": "PR-04", "translate_ticket_user": "PR-05", "translate_reply": "PR-06",
+              "translate_reply_user": "PR-07", "judge_answer": "PR-08"}
 DONT_KNOW = ("I'm sorry, but I don't have documentation that answers this, so I won't guess. "
              "I've passed your ticket to a member of the support team, who will follow up with you.")
 _FENCE = re.compile(r"<\s*/?\s*(customer_ticket|passages?|system|instructions)\b[^>]*>", re.I)
@@ -117,6 +123,11 @@ class Prompt:
     def version(self) -> str:
         """'<name>.v<N>@<sha8>': recorded with every decision, so an edited file is visible."""
         return f"{self.name}.v{self.number}@{hashlib.sha256(self.text.encode()).hexdigest()[:8]}"
+
+    @property
+    def ref(self) -> str:
+        """'PR-01 v2': the prompt register id and version."""
+        return f"{PROMPT_IDS.get(self.name, self.name)} v{self.number}"
 
     @property
     def placeholders(self) -> set[str]:
@@ -173,6 +184,7 @@ class GeneratedAnswer(BaseModel):
     error: str = ""
     raw_output: str = ""              # the model's last raw reply, for the decision log
     purpose: str = "reply"            # "reply" (may be sent) | "agent_draft" (for a person to review)
+    prompt_ref: str = ""              # prompt register ids, e.g. "PR-01 v2+PR-02 v1+PR-03 v1"
     reply_language: str = "en"        # language of answer_text's main part
     answer_text_en: str = ""          # the English reply the guardrails verify (= answer_text if English)
     translation_error: str = ""       # why a reply could not be translated, if it could not
@@ -385,7 +397,8 @@ def render(claims: Sequence[Claim], passages: Sequence[Passage]) -> tuple[str, l
     sources = [Citation(number=n, chunk_id=cid, doc_id=by_chunk[cid].doc_id, title=by_chunk[cid].title)
                for cid, n in numbers.items()]
     src = "\n".join(f"[{s.number}] {s.title} ({s.doc_id})" for s in sources)
-    return f"{OPENING}\n\n" + " ".join(sentences) + f"\n\n{CLOSING}\n\nSources:\n{src}", sources
+    return (f"{OPENING}\n\n" + " ".join(sentences) + f"\n\n{CLOSING}\n\n{AUTOMATED_NOTE}\n\nSources:\n{src}",
+            sources)
 
 
 # ------------------------------------------------------------------ extractive fallback
@@ -405,6 +418,28 @@ def extractive_claims(passages: Sequence[Passage]) -> list[Claim]:
 
 
 # ------------------------------------------------------------------ the generator
+class CallBudget:
+    """A cap on model calls per rolling hour (LLM_HOURLY_CALL_BUDGET; 0 = no cap), so a surge in
+    volume cannot run up cost or exhaust a free tier unnoticed. Over the cap, replies are built from
+    the articles without a model and say so (degraded), and translation is not attempted."""
+
+    def __init__(self, limit: Optional[int] = None):
+        self.limit = int(os.getenv("LLM_HOURLY_CALL_BUDGET", "600") if limit is None else limit)
+        self.calls: list[float] = []
+
+    def take(self) -> None:
+        now = time.time()
+        self.calls = [c for c in self.calls if now - c < 3600]
+        if self.limit and len(self.calls) >= self.limit:
+            raise LLMError(f"hourly model-call budget of {self.limit} reached (LLM_HOURLY_CALL_BUDGET)")
+        self.calls.append(now)
+
+    @property
+    def used_this_hour(self) -> int:
+        now = time.time()
+        return sum(1 for c in self.calls if now - c < 3600)
+
+
 class Generator:
     """Drafts answers. Its three prompts come from prompts/build/ at their pinned versions:
     generate_answer (system), generate_answer_user (user message), repair_reply (follow-up)."""
@@ -413,19 +448,21 @@ class Generator:
                  unavailable_reason: str = ""):
         self.client = client
         self.unavailable_reason = unavailable_reason
+        self.budget = CallBudget()
         try:
             self.system = load_prompt(*SYSTEM_PROMPT, root=prompts_dir)
             self.user_template = load_prompt(*USER_PROMPT, root=prompts_dir)
             self.repair = load_prompt(*REPAIR_PROMPT, root=prompts_dir)
             self.system_prompt = self.system.text
             self.prompt_version = "+".join(p.version for p in (self.system, self.user_template, self.repair))
+            self.prompt_ref = "+".join(p.ref for p in (self.system, self.user_template, self.repair))
             self.translate_prompts = {k: load_prompt(*v, root=prompts_dir) for k, v in (
                 ("ticket", TRANSLATE_TICKET), ("ticket_user", TRANSLATE_TICKET_USER),
                 ("reply", TRANSLATE_REPLY), ("reply_user", TRANSLATE_REPLY_USER))}
         except PromptError as exc:
             self.system = self.user_template = self.repair = None
             self.translate_prompts = {}
-            self.system_prompt, self.prompt_version = "", ""
+            self.system_prompt, self.prompt_version, self.prompt_ref = "", "", ""
             self.client = None
             self.unavailable_reason = f"prompt file missing: {exc}"
 
@@ -441,6 +478,7 @@ class Generator:
             log.exception("generation failed for %s", t.ticket_id)
             out = self._dont_know(t, generator="none", error=f"{type(exc).__name__}: {exc}", status="failed")
         out.purpose = purpose
+        out.prompt_ref = self.prompt_ref
         if not out.answer_text_en:
             out.answer_text_en = out.answer_text
         out.latency_ms = round((time.perf_counter() - started) * 1000, 2)
@@ -475,6 +513,7 @@ class Generator:
                     {"role": "user", "content": self.translate_prompts["ticket_user"].render(
                         language=LANGUAGE_NAMES.get(t.language, t.language), ticket=text)}]
         try:
+            self.budget.take()
             out = self.client.complete(messages, max_tokens=800).strip()
         except Exception as exc:
             return None, f"translation failed: {exc}"
@@ -493,6 +532,7 @@ class Generator:
                         language=LANGUAGE_NAMES.get(t.language, t.language))},
                     {"role": "user", "content": self.translate_prompts["reply_user"].render(reply=a.answer_text)}]
         try:
+            self.budget.take()
             local = self.client.complete(messages, max_tokens=1000).strip()
         except Exception as exc:
             a.translation_error = f"translation failed: {exc}"
@@ -521,8 +561,9 @@ class Generator:
         raw, last_error = "", ""
         for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
+                self.budget.take()
                 raw = self.client.complete(messages)
-            except Exception as exc:          # provider down, rate limited past retries, bad key
+            except Exception as exc:          # provider down, rate limited past retries, bad key, budget
                 return self._extractive(t, passages, f"model unavailable: {exc}", attempts=attempt)
             try:
                 status, claims, missing = parse_reply(raw, labels)

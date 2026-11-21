@@ -30,7 +30,9 @@ def test_record_and_trail_round_trip(store):
     assert row["decision_id"] == did and row["confidence"] == 0.42 and row["threshold"] == 0.8
     assert row["sources_used"] == [{"chunk_id": "DOC-BILL-001::full"}]
     assert row["details"]["decided_by"] == "documentation"
-    assert row["requirement_ids"] == ["A5"] and row["input_digest"] and row["created_at"]
+    assert row["requirement_ids"] == ["FR-04", "FR-07", "FR-08", "FR-10", "FR-11", "A5"]
+    assert row["input_digest"] and row["created_at"] and row["input_summary"] == "My invoice is wrong"
+    assert row["model_name"].startswith("router")
 
 
 def test_input_is_logged_with_personal_data_masked(store):

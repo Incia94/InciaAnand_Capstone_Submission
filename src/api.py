@@ -103,6 +103,25 @@ def kill_switch_active() -> bool:
     return Path(os.getenv("KILL_SWITCH_FILE", "./storage/KILL_SWITCH")).exists()
 
 
+def kill_switch_command(action: str) -> int:
+    """Turn automatic replies off or on without a restart or deployment. Takes effect on the next
+    ticket and on tickets in flight (checked again just before a reply is sent)."""
+    path = Path(os.getenv("KILL_SWITCH_FILE", "./storage/KILL_SWITCH"))
+    if action == "on":
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"switched on {time.strftime('%Y-%m-%d %H:%M:%S %Z')}\n")
+    elif action == "off":
+        if path.exists():
+            path.unlink()
+        if os.getenv("KILL_SWITCH", "").strip().lower() in ("1", "true", "on", "yes"):
+            print("Note: KILL_SWITCH is also set in the environment; unset it and restart to fully turn it off.")
+    elif action != "status":
+        print("usage: python -m src.api kill on|off|status")
+        return 2
+    print(f"kill switch: {'ON - every ticket is escalated' if kill_switch_active() else 'off'} ({path})")
+    return 0
+
+
 class PipelineState(TypedDict, total=False):
     """What flows between the graph's nodes. Each node returns only the keys it changes."""
     raw: Any
@@ -176,7 +195,8 @@ class SupportPipeline:
         g.add_conditional_edges("generate", self._after_generate,
                                 {"guardrail": "guardrail", "escalate": "escalate", "error": "error"})
         g.add_conditional_edges("guardrail", self._after_guardrail,
-                                {"send": "send", "escalate": "escalate", "error": "error"})
+                                {"send": "send", "escalate": "escalate", "kill_switch": "kill_switch",
+                                 "error": "error"})
         for name in ("send", "escalate", "kill_switch"):
             g.add_conditional_edges(name, self._unless_error("finish"), {"finish": "finish", "error": "error"})
         g.add_edge("error", "finish")
@@ -224,7 +244,10 @@ class SupportPipeline:
     def _after_guardrail(state: PipelineState) -> str:
         if state.get("error"):
             return "error"
-        return "send" if state["outbound"].released else "escalate"
+        if not state["outbound"].released:
+            return "escalate"
+        # checked again at the last moment: switching it on stops tickets already in flight too
+        return "kill_switch" if kill_switch_active() else "send"
 
     # ---------------- nodes
     def _ingest(self, state: PipelineState) -> dict:
@@ -292,7 +315,8 @@ class SupportPipeline:
 
     def _guardrail(self, state: PipelineState) -> dict:
         t, a = state["ticket"], state["answer"]
-        out = release(t, a, state["retrieval"], self.guardrails, self.store, state.get("run_id"))
+        out = release(t, a, state["retrieval"], self.guardrails, self.store, state.get("run_id"),
+                      decision=state["decision"])
         update: dict = {"outbound": out}
         if not out.released:
             if self.metrics:
@@ -323,6 +347,10 @@ class SupportPipeline:
         handoff = d.handoff.model_dump() if d.handoff else None
         if handoff is not None:
             handoff["draft_reply"] = draft
+            if any(f.startswith("possible_instruction_injection") for f in t.flags):
+                handoff["review_required"] = True
+                handoff["uncertainties"] = handoff.get("uncertainties", []) + [
+                    "The ticket contains text that tries to instruct the system: review the input before replying."]
         outcome = TicketOutcome(ticket_id=t.ticket_id, channel=t.channel.value, outcome="escalated", reason=d.reason,
                                 decided_by=d.decided_by, intent=d.intent, urgency=d.urgency, confidence=d.confidence,
                                 sources=[s.model_dump() for s in d.sources], handoff=handoff, draft_reply=draft,
@@ -372,9 +400,22 @@ class SupportPipeline:
     def _kill_switch(self, state: PipelineState) -> dict:
         t = state["ticket"]
         detail = "The kill switch is on, so no reply is sent automatically."
+        handoff = _minimal_handoff(t, detail)
+        draft = None
+        out = state.get("outbound")
+        if out is not None and out.released:          # stopped in flight: the checked reply becomes a draft
+            a = state["answer"]
+            draft = {"status": "drafted", "text": mask_pii(a.answer_text), "text_en": mask_pii(a.answer_text_en),
+                     "language": a.reply_language, "sources": [s_.model_dump() for s_ in a.sources],
+                     "generator": a.generator, "guardrail_passed": True, "guardrail_issues": [],
+                     "note": "Passed every guardrail but held back by the kill switch. Not sent."}
+            handoff["draft_reply"] = draft
+        self.store.record(t.ticket_id, "kill_switch", "escalate", detail, run_id=state.get("run_id"),
+                          input_text=t.text, details={"stopped_in_flight": draft is not None})
         return {"outcome": TicketOutcome(
             ticket_id=t.ticket_id, channel=t.channel.value, outcome="escalated",
-            reason="Escalated to a person. " + detail, decided_by="kill_switch", handoff=_minimal_handoff(t, detail))}
+            reason="Escalated to a person. " + detail, decided_by="kill_switch", handoff=handoff,
+            draft_reply=draft, language=t.language)}
 
     def _error(self, state: PipelineState) -> dict:
         t = state.get("ticket") or normalise_ticket(state.get("raw"))
@@ -442,7 +483,9 @@ class SupportPipeline:
                           "client": type(self.generator.client).__name__ if self.generator.client else None,
                           "model": getattr(self.generator.client, "model", ""),
                           "reason": self.generator.unavailable_reason,
-                          "prompt_version": self.generator.prompt_version},
+                          "prompt_version": self.generator.prompt_version,
+                          "model_calls_this_hour": self.generator.budget.used_this_hour,
+                          "hourly_call_budget": self.generator.budget.limit},
             "decision_log": {"healthy": self.store.healthy, "path": str(self.store.path),
                              "write_failures": self.store.write_failures},
             "kill_switch": kill_switch_active(),
@@ -583,6 +626,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     if argv[:1] == ["graph"]:          # python -m src.api graph  -> Mermaid diagram of the pipeline
         print(SupportPipeline.from_env().mermaid())
         return 0
+    if argv[:1] == ["kill"]:           # python -m src.api kill on|off|status
+        return kill_switch_command(argv[1] if len(argv) > 1 else "status")
     import uvicorn
     uvicorn.run(create_app(), host=os.getenv("API_HOST", "127.0.0.1"), port=int(os.getenv("API_PORT", "8000")))
     return 0

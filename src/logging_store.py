@@ -20,6 +20,14 @@ acceptance criteria need:
     model_version   classifier / embedding / LLM version behind the decision
     details         JSON with the stage's full output (alternatives, scores, checks, handoff)
     latency_ms
+and four columns the Governance Framework's minimum record names explicitly:
+    input_summary      a short masked summary of the input (first 200 characters)
+    model_name         which model or component decided: classifier, retriever, router, the LLM
+    alternatives       the other options considered, with confidences (classification)
+    guardrail_results  one word per check, e.g. {"pii": "pass", "grounding": "pass", "tone": "pass"}
+requirement_ids holds the PRD requirement ids (FR-xx) and the acceptance criteria (Axx) a stage
+serves; prompt_version holds the prompt register ids (PR-xx vN) and the exact file versions.
+A database created by an earlier version is upgraded in place (the new columns are added).
 
 One row per stage per ticket: ingest, classify, retrieve, route, generate, guardrail, and a final
 `outcome` row (sent or escalated). A ticket that fails part-way still gets an `error` row and an
@@ -51,9 +59,12 @@ DEFAULT_URL = "sqlite:///./storage/decisions.db"
 STAGES = ("ingest", "classify", "retrieve", "route", "generate", "guardrail", "outcome", "error")
 # Which requirement each stage serves. The Build Specification's acceptance criteria are given;
 # add your own PRD requirement ids (e.g. "FR-03") so every logged decision traces to a requirement.
-REQUIREMENT_IDS = {
-    "ingest": ["A2"], "classify": ["A3"], "retrieve": ["A4"], "route": ["A5"], "generate": ["A6"],
-    "guardrail": ["A7"], "outcome": ["A8", "A9"], "error": ["A11"], "translate": ["A2"], "draft": ["A5", "A6"],
+REQUIREMENT_IDS = {   # PRD functional requirements (FR) and Build Specification criteria (A) per stage
+    "ingest": ["FR-01", "A2"], "translate": ["FR-12", "FR-09"], "classify": ["FR-02", "A3"],
+    "retrieve": ["FR-03", "FR-10", "A4"], "route": ["FR-04", "FR-07", "FR-08", "FR-10", "FR-11", "A5"],
+    "generate": ["FR-05", "FR-12", "A6"], "guardrail": ["FR-06", "FR-08", "FR-09", "A7"],
+    "draft": ["FR-13"], "outcome": ["FR-14", "FR-15", "A8", "A9"], "error": ["FR-16", "A11"],
+    "kill_switch": ["FR-16"],
 }
 
 SCHEMA = """
@@ -76,14 +87,23 @@ CREATE TABLE IF NOT EXISTS decisions (
     input_text      TEXT,
     model_version   TEXT,
     details         TEXT,
-    latency_ms      REAL
+    latency_ms      REAL,
+    input_summary   TEXT,
+    model_name      TEXT,
+    alternatives    TEXT,
+    guardrail_results TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_ticket ON decisions (ticket_id);
 CREATE INDEX IF NOT EXISTS idx_decisions_run ON decisions (run_id, stage);
 """
 COLUMNS = ("decision_id", "created_at", "ticket_id", "stage", "prediction", "confidence", "threshold",
            "action_taken", "reason", "sources_used", "guardrails", "prompt_version", "requirement_ids",
-           "run_id", "input_digest", "input_text", "model_version", "details", "latency_ms")
+           "run_id", "input_digest", "input_text", "model_version", "details", "latency_ms",
+           "input_summary", "model_name", "alternatives", "guardrail_results")
+ADDED_COLUMNS = {"input_summary": "TEXT", "model_name": "TEXT", "alternatives": "TEXT", "guardrail_results": "TEXT"}
+# Framework names for the guardrail checks (others keep their own names).
+GUARDRAIL_NAMES = {"private_data": "pii", "claim_support": "grounding", "injection": "instruction_integrity",
+                   "forbidden_claims": "scope_and_commitments"}
 
 
 # ------------------------------------------------------------------ masking personal data
@@ -98,6 +118,11 @@ PII_PATTERNS = [
     ("jwt", re.compile(r"\beyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,}\b")),
     ("secret_assignment", re.compile(r"\b(?:password|passwd|api[_ -]?key|secret|token)\s*[:=]\s*\S{4,}", re.I)),
     ("long_token", re.compile(r"\b(?=[A-Za-z0-9_-]*\d)(?=[A-Za-z0-9_-]*[A-Za-z])[A-Za-z0-9_-]{32,}\b")),
+    ("postal_address", re.compile(r"\b\d{1,5}\s+(?:[A-Z][a-z]+\s){1,3}(?:Street|St|Road|Rd|Avenue|Ave|Lane|Ln|"
+                                  r"Boulevard|Blvd|Drive|Dr|Way|Court|Ct|Place|Pl)\b\.?")),
+    ("account_number", re.compile(r"\b(?:account|acct|iban)\s*(?:no\.?|number|#)?\s*[:#]?\s*(?=[A-Z0-9-]*\d)"
+                                  r"[A-Z0-9][A-Z0-9-]{5,}\b", re.I)),
+    ("iban", re.compile(r"\b[A-Z]{2}\d{2}(?:\s?[A-Z0-9]{4}){3,7}\b")),
 ]
 PHONE_PATTERN = re.compile(r"(?<![\w-])\+?\d[\d\s().-]{7,}\d(?![\w-])")
 CARD_PATTERN = re.compile(r"\b(?:\d[ -]?){13,19}\b")
@@ -127,6 +152,40 @@ def _mask_deep(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_mask_deep(v) for v in value]
     return value
+
+
+STAGE_MODEL = {"ingest": "ingest (rules)", "translate": "llm", "classify": "classifier (tf-idf + logistic "
+               "regression)", "retrieve": "retriever", "route": "router (rules + threshold)", "generate": "llm",
+               "guardrail": "guardrails (rules)", "draft": "llm", "outcome": "pipeline", "error": "pipeline",
+               "kill_switch": "pipeline"}
+
+
+def _summary(text: Optional[str], limit: int = 200) -> Optional[str]:
+    if not text:
+        return None
+    flat = " ".join(mask_pii(text).split())
+    return flat if len(flat) <= limit else flat[:limit].rsplit(" ", 1)[0] + "…"
+
+
+def _handoff_for_log(h: Any) -> Optional[dict]:
+    """The handoff as logged: the customer's name masked (the agent sees it; the audit log need not)."""
+    if h is None:
+        return None
+    out = h.model_dump() if hasattr(h, "model_dump") else dict(h)
+    name = (out.get("customer") or {}).get("name")
+    if name:
+        out["customer"]["name"] = mask(name)
+        out["summary"] = (out.get("summary") or "").replace(name, mask(name))
+    return out
+
+
+def guardrail_summary(checks: Sequence[Any]) -> dict:
+    """{framework name: pass | block | warn} for a list of guardrail CheckResults."""
+    out = {}
+    for c in checks:
+        sev = {f.severity for f in c.findings}
+        out[GUARDRAIL_NAMES.get(c.name, c.name)] = "block" if not c.passed else ("warn" if "warn" in sev else "pass")
+    return out
 
 
 def _json(value: Any) -> Optional[str]:
@@ -162,6 +221,10 @@ class DecisionStore:
             self._conn = sqlite3.connect(str(self.path), timeout=10, check_same_thread=False)
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.executescript(SCHEMA)
+            have = {row[1] for row in self._conn.execute("PRAGMA table_info(decisions)")}
+            for col, kind in ADDED_COLUMNS.items():          # upgrade a database from an earlier version
+                if col not in have:
+                    self._conn.execute(f"ALTER TABLE decisions ADD COLUMN {col} {kind}")
             self._conn.commit()
         except (sqlite3.Error, OSError) as exc:
             log.error("decision database %s unavailable (%s); writing to %s", self.path, exc, self.fallback_path)
@@ -183,7 +246,8 @@ class DecisionStore:
                guardrails: Any = None, prompt_version: Optional[str] = None,
                requirement_ids: Optional[Sequence[str]] = None, run_id: Optional[str] = None,
                input_text: Optional[str] = None, model_version: Optional[str] = None, details: Any = None,
-               latency_ms: Optional[float] = None) -> str:
+               latency_ms: Optional[float] = None, model_name: Optional[str] = None, alternatives: Any = None,
+               guardrail_results: Any = None) -> str:
         """Write one decision. Returns its id. Never raises."""
         row = {
             "decision_id": uuid.uuid4().hex,
@@ -206,6 +270,10 @@ class DecisionStore:
             "model_version": model_version,
             "details": _json(details),
             "latency_ms": latency_ms,
+            "input_summary": _summary(input_text),
+            "model_name": model_name or STAGE_MODEL.get(stage),
+            "alternatives": _json(alternatives),
+            "guardrail_results": _json(guardrail_results),
         }
         with self._lock:
             if self._conn is not None:
@@ -245,6 +313,8 @@ class DecisionStore:
         return self.record(c.ticket_id, "classify", action, reason, prediction=c.intent, confidence=c.intent_confidence,
                            run_id=run_id, input_text=ticket_text, model_version=c.model_version,
                            latency_ms=c.latency_ms,
+                           alternatives=[{"value": a.label, "confidence": a.probability}
+                                         for a in c.intent_alternatives[1:]],
                            details={"urgency": c.urgency, "urgency_confidence": c.urgency_confidence,
                                     "intent_alternatives": [a.model_dump() for a in c.intent_alternatives],
                                     "urgency_alternatives": [a.model_dump() for a in c.urgency_alternatives],
@@ -255,8 +325,9 @@ class DecisionStore:
                   else f"No passage returned: {r.reason}")
         return self.record(r.ticket_id, "retrieve", r.status, reason,
                            prediction=r.passages[0].doc_id if r.passages else None, confidence=r.top_score,
-                           threshold=r.threshold, sources=[{"chunk_id": p.chunk_id, "score": p.score}
-                                                           for p in r.passages],
+                           threshold=r.threshold, sources=[{"doc_id": p.doc_id, "chunk_id": p.chunk_id,
+                                                            "score": p.score} for p in r.passages],
+                           model_name=f"retriever ({r.backend})",
                            run_id=run_id, input_text=ticket_text, latency_ms=r.latency_ms,
                            details={"candidates": [x.model_dump() for x in r.candidates], "backend": r.backend,
                                     "degraded": r.degraded, "reason": r.reason})
@@ -267,7 +338,7 @@ class DecisionStore:
                            input_text=ticket_text, model_version=d.config_version, latency_ms=d.latency_ms,
                            details={"decided_by": d.decided_by, "checks": [c.model_dump() for c in d.checks],
                                     "inputs_digest": d.inputs_digest,
-                                    "handoff": d.handoff.model_dump() if d.handoff else None})
+                                    "handoff": _handoff_for_log(d.handoff)})
 
     def log_generate(self, a: Any, ticket_text: str = "", run_id: Optional[str] = None) -> str:
         reason = {"answered": f"Drafted {len(a.claims)} cited claim(s) with the {a.generator} generator.",
@@ -275,8 +346,11 @@ class DecisionStore:
                   }.get(a.status, f"Generation failed: {a.error}")
         if a.degraded:
             reason += f" Degraded: {a.error}"
+        ref = getattr(a, "prompt_ref", "")
         return self.record(a.ticket_id, "generate", a.status, reason, prediction=a.generator,
-                           sources=[s.model_dump() for s in a.sources], prompt_version=a.prompt_version,
+                           sources=[s.model_dump() for s in a.sources],
+                           prompt_version=f"{ref} ({a.prompt_version})" if ref else a.prompt_version,
+                           model_name=f"llm: {a.model}" if a.model else a.generator,
                            run_id=run_id, input_text=ticket_text, model_version=a.model or a.generator,
                            latency_ms=a.latency_ms,
                            details={"claims": [c.model_dump() for c in a.claims], "attempts": a.attempts,
@@ -288,8 +362,9 @@ class DecisionStore:
                                     "data_policy": getattr(a, "data_policy", "")})
 
     def log_guardrail(self, v: Any, ticket_text: str = "", run_id: Optional[str] = None) -> str:
-        return self.record(v.ticket_id, "guardrail", "released" if v.released else "blocked", v.reason,
+        return self.record(v.ticket_id, "guardrail", "release" if v.released else "block", v.reason,
                            guardrails=[c.model_dump() for c in v.checks], prompt_version=v.prompt_version,
+                           guardrail_results=guardrail_summary(v.checks),
                            run_id=run_id, input_text=ticket_text, model_version=v.generator,
                            latency_ms=v.latency_ms,
                            details={"blocked_by": v.blocked_by, "claims_checked": v.claims_checked,
@@ -330,7 +405,8 @@ class DecisionStore:
         for r in self._rows("WHERE ticket_id = ?", (ticket_id,)):
             if r.get("ticket_id") != ticket_id:
                 continue
-            for col in ("sources_used", "guardrails", "requirement_ids", "details"):
+            for col in ("sources_used", "guardrails", "requirement_ids", "details", "alternatives",
+                        "guardrail_results"):
                 if isinstance(r.get(col), str):
                     try:
                         r[col] = json.loads(r[col])

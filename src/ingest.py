@@ -425,6 +425,8 @@ def normalise_ticket(raw: Any) -> NormalisedTicket:
         fluency = _enum(_get(raw, "language_fluency"), Fluency, flags, "language_fluency")
 
         labels, history = raw.get("labels"), raw.get("history")
+        if INJECTION_ATTEMPT.search(f"{to_str(raw_subject, [])}\n{to_str(raw_body, [])}"):
+            flags.append("possible_instruction_injection: review required")
         language, lang_conf = detect_language(text)
         if language not in ("en", "und"):
             flags.append(f"language_{language}")
@@ -457,6 +459,17 @@ def normalise_ticket(raw: Any) -> NormalisedTicket:
         log.exception("unexpected error normalising ticket")
         return NormalisedTicket(ticket_id=_fallback_id(raw), channel=Channel.unknown, processable=False,
                                 flags=flags + [f"normalisation_error:{type(exc).__name__}"], **originals)
+
+
+# ------------------------------------------------------------------ tickets: instruction integrity
+# Text that tries to instruct the system. Such a ticket is still processed, but it is flagged so the
+# decision log records the input for review, and the guardrails block any reply to it.
+INJECTION_ATTEMPT = re.compile(
+    r"\b(?:ignore|disregard|forget|override)\b[^.]{0,30}\b(?:previous|prior|above|earlier|your|all|the)\b[^.]{0,20}"
+    r"\b(?:instructions?|rules|prompt|guidelines)\b|\byou are now\b|\bnew instructions?\b|^\s*system\s*:"
+    r"|\bsystem prompt\b|\breveal your\b|\bpretend (?:to be|you are)\b"
+    r"|\bact as (?:an?|the) (?:admin|administrator|developer|system)\b"
+    r"|<\s*/?\s*(?:customer_ticket|passages?|system|instructions)\b", re.I | re.M)
 
 
 # ------------------------------------------------------------------ tickets: language

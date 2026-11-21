@@ -20,20 +20,26 @@ structure        the answer is well-formed: answered replies have claims, every 
                  passage that was actually retrieved, and each cited passage is exactly the
                  corpus text with that id
 private_data     no email addresses, phone numbers, payment card numbers (Luhn-checked), IP
-                 addresses, customer ids, or secrets (API keys, tokens, passwords) in the reply
+                 addresses, postal addresses, account numbers or IBANs, customer ids, the customer's
+                 name, or secrets (API keys, tokens, passwords) in the reply. Block and escalate;
+                 never redact and send (Governance Framework)
 claim_support    every claim is supported by the passages it cites: at least SUPPORT_THRESHOLD of
                  its content words appear in them, and every number in it appears in them
 forbidden_claims nothing the senior agents' must_not_claim lists rule out: that a refund has been
                  issued, that the issue has been fixed on our side, or a date for a fix
 secret_request   the reply does not ask the customer to send a password, key, token or code
 injection        the reply does not repeat our instructions or show signs of following a
-                 customer's instructions (e.g. "ignore previous instructions")
+                 customer's instructions; and if the ticket itself tries to instruct the system, the
+                 reply is blocked and the input is flagged for review (Governance Framework)
                  + money_claim: no amounts, charges, credits, refunds or waivers (billing replies
                  explain how billing works only in the articles' general terms)
                  + roadmap_claim: no future features, plans, release timing
                  + compliance_commitment: no guarantees, certifications or legal promises
                  (structure also blocks any answered reply that does not cite at least one article)
 tone             no insults or profanity (block); shouting in capitals is recorded as a warning
+confidence_floor (Governance Framework) the routing threshold was actually applied to this reply:
+                 a routing decision exists, says auto_respond, and its confidence meets its threshold.
+                 A missing confidence is treated as failing, never as high.
 translation      a reply translated for a non-English customer carries exactly the numbers and
                  citation markers of the verified English version printed below it
 
@@ -64,7 +70,7 @@ from typing import Any, Optional, Sequence
 from pydantic import BaseModel
 
 from src.generate import DONT_KNOW, SYSTEM_PROMPT, USER_PROMPT, GeneratedAnswer, PromptError, load_prompt
-from src.ingest import NormalisedTicket, normalise_ticket
+from src.ingest import INJECTION_ATTEMPT, NormalisedTicket, normalise_ticket
 from src.logging_store import CARD_PATTERN, PHONE_PATTERN, PII_PATTERNS, DecisionStore, mask
 from src.retrieve import Corpus, RetrievalResult
 
@@ -245,15 +251,18 @@ class Guardrails:
         except PromptError:
             self._prompt_ngrams = set()
 
-    def check(self, ticket: Any, answer: GeneratedAnswer, retrieval: RetrievalResult) -> GuardrailResult:
-        """Runs every check. Never raises: an error inside a check blocks the reply."""
+    def check(self, ticket: Any, answer: GeneratedAnswer, retrieval: RetrievalResult, decision: Any = None,
+              require_routing: bool = False) -> GuardrailResult:
+        """Runs every check. Never raises: an error inside a check blocks the reply. With
+        require_routing (as when releasing a reply), a missing routing decision blocks."""
         started = time.perf_counter()
         t = ticket if isinstance(ticket, NormalisedTicket) else normalise_ticket(ticket)
         checks = []
+        floor = lambda t_, a_, r_: self._confidence_floor(decision, require_routing)   # noqa: E731
         for name, fn in (("structure", self._structure), ("private_data", self._private_data),
                          ("claim_support", self._claim_support), ("forbidden_claims", self._forbidden),
                          ("secret_request", self._secret_request), ("injection", self._injection),
-                         ("tone", self._tone), ("translation", self._translation)):
+                         ("tone", self._tone), ("translation", self._translation), ("confidence_floor", floor)):
             try:
                 findings, stats = fn(t, answer, retrieval)
             except Exception as exc:   # a check that cannot run must not wave a reply through
@@ -333,7 +342,7 @@ class Guardrails:
                 f.append(Finding(kind="payment_card", severity="block",
                                  detail=f"Possible card number: {mask(digits)}."))
         if t.customer_name and len(t.customer_name) > 3 and t.customer_name.lower() in text.lower():
-            f.append(Finding(kind="customer_name", severity="warn",
+            f.append(Finding(kind="customer_name", severity="block",
                              detail="The reply contains the customer's name, which the model was never given."))
         return f, {"detections": sum(x.severity == "block" for x in f)}
 
@@ -377,8 +386,31 @@ class Guardrails:
             f.append(Finding(kind="injection_sign", severity="block",
                              detail="The reply shows signs of following injected instructions "
                                     f"(\"{m.group()[:40]}\")."))
-        attempt = bool(_INJECTION_SIGNS.search(t.text)) or "system:" in t.text.lower()
-        return f, {"ticket_contains_injection_attempt": attempt}
+        source = f"{t.original_subject}\n{t.original_body}" if (t.original_subject or t.original_body) else t.text
+        attempt = bool(INJECTION_ATTEMPT.search(source) or _INJECTION_SIGNS.search(t.text))
+        if attempt:   # Governance Framework: block, escalate and record the input for review
+            f.append(Finding(kind="injection_attempt_in_ticket", severity="block",
+                             detail="The ticket contains text that tries to instruct the system, so no reply is "
+                                    "sent automatically; the input is recorded for review."))
+        return f, {"ticket_contains_injection_attempt": attempt, "review_required": attempt}
+
+    @staticmethod
+    def _confidence_floor(decision: Any, required: bool):
+        """The routing threshold was actually applied. A missing confidence is not a high one."""
+        if decision is None:
+            if required:
+                return [Finding(kind="no_routing_decision", severity="block",
+                                detail="No routing decision was recorded for this reply.")], {"applied": False}
+            return [], {"applied": False}
+        conf, th = getattr(decision, "confidence", None), getattr(decision, "threshold", None)
+        ok = (getattr(decision, "action", "") == "auto_respond" and isinstance(conf, (int, float))
+              and isinstance(th, (int, float)) and conf == conf and conf >= th)
+        if ok:
+            return [], {"applied": True, "confidence": conf, "threshold": th}
+        return [Finding(kind="below_confidence_floor", severity="block",
+                        detail=f"The routing threshold was not met or not applied (confidence {conf}, "
+                               f"threshold {th}, action {getattr(decision, 'action', None)}).")], \
+            {"applied": True, "confidence": conf, "threshold": th}
 
     def _translation(self, t, a: GeneratedAnswer, r):
         """A translated reply must say what the verified English says: the same numbers and the
@@ -421,12 +453,13 @@ def default_store() -> DecisionStore:
 
 def release(ticket: Any, answer: GeneratedAnswer, retrieval: RetrievalResult,
             guardrails: Optional[Guardrails] = None, store: Optional[DecisionStore] = None,
-            run_id: Optional[str] = None) -> Outbound:
-    """The only way a reply is released. Always checks and always records. Never raises."""
+            run_id: Optional[str] = None, decision: Any = None) -> Outbound:
+    """The only way a reply is released. Always checks and always records. Never raises.
+    When the pipeline passes its routing decision, the confidence floor is enforced on it."""
     t = ticket if isinstance(ticket, NormalisedTicket) else normalise_ticket(ticket)
     guardrails = guardrails or Guardrails()
     try:
-        result = guardrails.check(t, answer, retrieval)
+        result = guardrails.check(t, answer, retrieval, decision=decision, require_routing=decision is not None)
     except Exception as exc:  # check() does not raise, but if it ever did, nothing is sent
         log.exception("guardrails crashed for %s", t.ticket_id)
         result = GuardrailResult(ticket_id=t.ticket_id, released=False, blocked_by=["guardrail_error"],

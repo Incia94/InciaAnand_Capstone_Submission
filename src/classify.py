@@ -54,6 +54,7 @@ import logging
 import os
 import sys
 import time
+import warnings
 from collections import Counter
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
@@ -222,6 +223,14 @@ class Classifier:
 
     # ---------------- training
     def fit(self, tickets: Iterable[Any]) -> "Classifier":
+        """Train on labelled tickets (see _fit). On Apple Silicon, numpy 2 with Apple's Accelerate
+        library raises spurious 'divide by zero / overflow encountered in matmul' warnings on
+        ordinary sparse inputs; the results are unaffected, so only those messages are silenced."""
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*encountered in matmul", category=RuntimeWarning)
+            return self._fit(tickets)
+
+    def _fit(self, tickets: Iterable[Any]) -> "Classifier":
         from sklearn.linear_model import LogisticRegression
         from sklearn.metrics.pairwise import cosine_similarity
         from sklearn.model_selection import GroupKFold, StratifiedKFold
@@ -502,4 +511,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Run main() from the importable module, not from __main__, so a model saved by
+    # `python -m src.classify train` pickles as src.classify.Classifier and loads anywhere
+    # (the API, the harness, the tests). Otherwise it can only be loaded by this command.
+    from src.classify import main as _main
+    sys.exit(_main())

@@ -4,6 +4,7 @@ import sqlite3
 import pytest
 
 from src import logging_store as L
+from tests import fakes
 
 
 @pytest.fixture
@@ -38,9 +39,9 @@ def test_record_and_trail_round_trip(store):
 def test_input_is_logged_with_personal_data_masked(store):
     store.record("T1", "ingest", "normalised", "ok",
                  input_text="I am a.rao@example.com, account CUST-1042, phone +44 20 7946 0958, "
-                            "key sk-live-ABCDEFGH12345678xyz")
+                            f"key {fakes.api_key(16, 'xyz')}")
     row = store.trail("T1")[0]
-    for secret in ("a.rao@example.com", "CUST-1042", "7946 0958", "sk-live-ABCDEFGH12345678xyz"):
+    for secret in ("a.rao@example.com", "CUST-1042", "7946 0958", fakes.api_key(16, "xyz")):
         assert secret not in row["input_text"]
     assert "I am" in row["input_text"]                       # the rest stays readable
 

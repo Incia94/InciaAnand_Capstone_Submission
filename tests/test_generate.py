@@ -10,6 +10,7 @@ import pytest
 from src import generate as G
 from src.ingest import normalise_ticket
 from src.retrieve import Corpus, Passage, RetrievalResult
+from tests import fakes
 
 DATA = Path(__file__).resolve().parents[1] / "data"
 CORPUS = Corpus.from_file(DATA / "documentation.json")
@@ -349,7 +350,7 @@ def test_langchain_client_cache(tmp_path):
 
 
 def test_build_generator_uses_langchain_by_default(monkeypatch, tmp_path):
-    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test-not-real")
+    monkeypatch.setenv("OPENROUTER_API_KEY", fakes.model_key())
     monkeypatch.setenv("LLM_CACHE_DIR", str(tmp_path))
     monkeypatch.delenv("LLM_CLIENT", raising=False)
     gen = G.build_generator()

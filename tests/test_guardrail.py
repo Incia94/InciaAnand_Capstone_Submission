@@ -10,6 +10,7 @@ from src.generate import DONT_KNOW, Claim, GeneratedAnswer, Generator, render
 from src.ingest import normalise_ticket
 from src.logging_store import DecisionStore
 from src.retrieve import Corpus, Passage, RetrievalResult
+from tests import fakes
 
 DATA = Path(__file__).resolve().parents[1] / "data"
 CORPUS = Corpus.from_file(DATA / "documentation.json")
@@ -102,10 +103,10 @@ def test_req1_every_extractive_answer_on_real_data_is_checked_and_released(guard
     (" Your card 4111 1111 1111 1111 was charged.", "payment_card"),
     (" Your server 192.168.10.24 is affected.", "ip_address"),
     (" This is about account CUST-1042.", "customer_id"),
-    (" Use key sk-live-ABCDEF1234567890abcdef.", "api_key"),
-    (" Your AWS key AKIAIOSFODNN7EXAMPLE is exposed.", "aws_key"),
-    (" Set password: hunter22 to continue.", "secret_assignment"),
-    (" Token eyJhbGciOiJIUzI1.eyJzdWIiOiIxMjM0.SflKxwRJSMeKKF2QT4", "jwt"),
+    (f" Use key {fakes.api_key()}.", "api_key"),
+    (f" Your AWS key {fakes.AWS_KEY} is exposed.", "aws_key"),
+    (f" {fakes.assignment_line()} to continue.", "secret_assignment"),
+    (f" Token {fakes.JWT}", "jwt"),
 ])
 def test_req2_private_data_is_detected(guards, leak, kind):
     res = guards.check(TICKET, answer(extra_text=leak), RETRIEVAL)

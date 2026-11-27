@@ -4,7 +4,6 @@ A supervisor sees every ticket from every channel and assigns it; an agent sees 
 tickets, checks Cirrus's cited reply and sends it. Everything is logged, and nothing on screen uses
 the pipeline's technical vocabulary."""
 import json
-import secrets
 from pathlib import Path
 
 import pytest
@@ -21,10 +20,12 @@ from src.retrieve import Corpus, Retriever, _labelled, approved_threshold_from, 
 from src.route import Router, RoutingConfig, _label_sets
 from src.staff import COOKIE, StaffDirectory
 from src.workspace import plain
+from tests import fakes
 
 DATA = Path(__file__).resolve().parents[1] / "data"
 WEB = Path(__file__).resolve().parents[1] / "src" / "web"
-PASSWORD = secrets.token_urlsafe(12)            # made up per test run: no password is written in the code
+PASSWORD = fakes.password()                      # made up per test run: no password is written in the code
+WRONG = fakes.password()
 ROLLBACK = ("How do I revert to an earlier revision? The release we put out this morning is causing errors and I "
             "would rather roll back than try to fix forward.")
 JARGON = ("RAG", "Tier ", "tier_", "intent", "threshold", "extractive", "lexical", "passage", "generator",
@@ -86,7 +87,7 @@ def test_passwords_are_stored_only_as_salted_hashes(tmp_path):
     raw = (tmp_path / "staff.json").read_text()
     assert PASSWORD not in raw and json.loads(raw)["a@cloudserve.example"]["hash"]
     assert s.check("a@cloudserve.example", PASSWORD)["role"] == "agent"
-    assert s.check("a@cloudserve.example", "wrong-password") is None
+    assert s.check("a@cloudserve.example", WRONG) is None
     with pytest.raises(ValueError):
         s.add("b@cloudserve.example", "B", "T", "agent", "short")
 
@@ -94,7 +95,7 @@ def test_passwords_are_stored_only_as_salted_hashes(tmp_path):
 def test_sign_in_page_and_wrong_password(app):
     c = TestClient(app)
     assert "Staff sign-in" in c.get("/").text
-    r = c.post("/staff/login", json={"email": "asha@cloudserve.example", "password": "nope-nope"})
+    r = c.post("/staff/login", json={"email": "asha@cloudserve.example", "password": WRONG})
     assert r.status_code == 401 and r.json()["detail"] == "Wrong username or password."
     assert c.get("/staff/me").status_code == 401
 
@@ -189,7 +190,7 @@ def test_edited_replies_are_checked_and_saved_drafts_kept(app):
     agent.post(f"/staff/tickets/{tid}/save", json={"text": "Draft in progress"})
     t = agent.get(f"/staff/tickets/{tid}").json()
     assert t["reply"] == "Draft in progress" and t["work_status"] == "In progress"
-    leak = agent.post(f"/staff/tickets/{tid}/send", json={"text": "Use key sk-live-ABCDEF1234567890ABCDEF12"})
+    leak = agent.post(f"/staff/tickets/{tid}/send", json={"text": f"Use key {fakes.api_key(24)}"})
     assert leak.status_code == 422 and "private_data" in leak.json()["detail"]
     ok = agent.post(f"/staff/tickets/{tid}/send", json={"text": "Roll back from the revisions page, then redeploy."})
     assert ok.json()["edited"] is True

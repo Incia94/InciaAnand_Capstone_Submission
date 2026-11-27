@@ -7,9 +7,10 @@ signs everyone out) and sent as an HttpOnly, SameSite=Lax cookie.
 Staff sign in with their username (the part of the email before @, or their first name; "admin" is
 the supervisor) or their full email.
 
-Demo accounts: when DEMO_ACCOUNTS is on (the default), the four demo accounts below are created on
-first use with the shared demo password DEMO_PASSWORD (default "password"). That password is for a
-demo on your own machine only: set DEMO_ACCOUNTS=off and add real accounts before anyone else uses it.
+Demo accounts: the four demo accounts below are created on first use with the shared password set
+as DEMO_PASSWORD in your .env file (which git ignores). No password is written in the code: without
+DEMO_PASSWORD, no demo accounts are made. DEMO_ACCOUNTS=off turns them off; add real accounts with
+`python -m src.staff add` before anyone else uses the workspace.
 
 Roles
   supervisor  sees every ticket from every channel, assigns them to agents, sees the reports and the
@@ -17,7 +18,7 @@ Roles
   agent       sees the tickets assigned to them, checks Cirrus's suggested reply, edits it and sends it
 
     python -m src.staff add --email asha@cloudserve.example --name "Asha" --team "API Support" --role agent
-    python -m src.staff demo        # (re)create the demo accounts with DEMO_PASSWORD, or one you type
+    python -m src.staff demo        # (re)create the demo accounts with DEMO_PASSWORD from .env, or one you type
     python -m src.staff list
 """
 from __future__ import annotations
@@ -39,7 +40,6 @@ ROLES = ("supervisor", "agent")
 ITERATIONS = 200_000
 SESSION_HOURS = 12
 COOKIE = "cirrus_session"
-DEMO_PASSWORD = "password"                 # demo only; override with DEMO_PASSWORD, disable with DEMO_ACCOUNTS=off
 DEMO_STAFF = [
     ("marcus@cloudserve.example", "Marcus Adeyemi", "Support Operations", "supervisor"),
     ("asha@cloudserve.example", "Asha", "API Support", "agent"),
@@ -107,14 +107,16 @@ class StaffDirectory:
         return None
 
     def ensure_demo(self) -> list[str]:
-        """Create any missing demo account (DEMO_ACCOUNTS on, the default). Existing ones are left alone."""
-        if os.getenv("DEMO_ACCOUNTS", "on").strip().lower() in ("off", "0", "false", "no"):
+        """Create any missing demo account, with the password from DEMO_PASSWORD (.env). Existing
+        accounts are left alone. Nothing happens without DEMO_PASSWORD or with DEMO_ACCOUNTS=off."""
+        password = os.getenv("DEMO_PASSWORD", "")
+        if not password or os.getenv("DEMO_ACCOUNTS", "on").strip().lower() in ("off", "0", "false", "no"):
             return []
         have = self._load()
         made = []
         for email, name, team, role in DEMO_STAFF:
             if email not in have:
-                self.add(email, name, team, role, os.getenv("DEMO_PASSWORD") or DEMO_PASSWORD)
+                self.add(email, name, team, role, password)
                 made.append(email)
         return made
 
@@ -181,7 +183,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"{u['role']:<11} {u['email']:<34} {u['name']} · {u['team']}")
         return 0
     if args.command == "demo":
-        password = os.getenv("STAFF_PASSWORD") or os.getenv("DEMO_PASSWORD") or DEMO_PASSWORD
+        password = (os.getenv("STAFF_PASSWORD") or os.getenv("DEMO_PASSWORD")
+                    or getpass.getpass("Demo password (at least 8 characters): "))
     else:
         password = os.getenv("STAFF_PASSWORD") or getpass.getpass("Password (at least 8 characters): ")
     try:
@@ -192,7 +195,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             for email, name, team, role in DEMO_STAFF:
                 staff.add(email, name, team, role, password)
                 print(f"Saved {role} {email.split('@')[0]:<7} ({name} · {team}).")
-            print("Sign in with the username (e.g. marcus, asha) and the demo password.")
+            print("Sign in with a username (e.g. marcus, asha) and the demo password.")
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 1

@@ -59,7 +59,7 @@ TECHNICAL_INTENTS = {"api_usage_question", "api_key_issue", "authentication_fail
 
 # Plain-language topics, for the agent workspace and the knowledge gap dashboard.
 INTENT_TOPICS = {
-    "api_key_issue": "API authentication", "authentication_failure": "Authentication",
+    "api_key_issue": "API authentication", "authentication_failure": "Authentication",  # pragma: allowlist secret
     "sso_configuration": "Single sign-on", "account_access": "Account permissions",
     "deployment_failure": "Deployment troubleshooting", "rollback_request": "Deployment troubleshooting",
     "configuration_help": "Configuration", "billing_query": "Billing and refunds",

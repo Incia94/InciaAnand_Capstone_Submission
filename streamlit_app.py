@@ -83,7 +83,11 @@ def sign_in():
             else:
                 st.session_state["user"] = found
                 st.rerun()
-        st.caption("Supervisor: **marcus** · Agents: **asha**, **sofia**, **ravi** · demo password: **password**")
+        st.caption("Supervisor: **marcus** · Agents: **asha**, **sofia**, **ravi**")
+    if not staff.list():
+        with mid:
+            st.warning("No staff accounts yet. Set DEMO_PASSWORD in your .env file and restart, "
+                       "or add accounts with `python -m src.staff add`.")
 
 
 # ---------------------------------------------------------------- supervisor

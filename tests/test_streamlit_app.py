@@ -6,9 +6,12 @@ from pathlib import Path
 import pytest
 
 from src.staff import StaffDirectory
+from tests import fakes
 
 APP = str(Path(__file__).resolve().parents[1] / "streamlit_app.py")
 AppTest = pytest.importorskip("streamlit.testing.v1").AppTest
+DEMO = fakes.password()                         # the demo password for this run, as if set in .env
+WRONG = fakes.password()
 
 
 @pytest.fixture
@@ -16,7 +19,7 @@ def env(tmp_path, monkeypatch):
     for k, v in dict(RETRIEVAL_BACKEND="lexical", GENERATOR="extractive", STAFF_FILE=tmp_path / "staff.json",
                      DATABASE_URL=f"sqlite:///{tmp_path / 'decisions.db'}", REVIEW_DB=tmp_path / "reviews.db",
                      TICKETS_DB=tmp_path / "tickets.db", KILL_SWITCH_FILE=tmp_path / "KS", REPLY_MODE="review",
-                     OPENROUTER_API_KEY="", DEMO_PASSWORD="").items():
+                     OPENROUTER_API_KEY="", DEMO_PASSWORD=DEMO).items():
         monkeypatch.setenv(k, str(v))
     monkeypatch.delenv("DEMO_ACCOUNTS", raising=False)
     import streamlit as st
@@ -25,7 +28,7 @@ def env(tmp_path, monkeypatch):
     st.cache_resource.clear()
 
 
-def sign_in(name, password="password"):
+def sign_in(name, password=DEMO):
     at = AppTest.from_file(APP, default_timeout=300).run()
     at.text_input[0].input(name)
     at.text_input[1].input(password)
@@ -39,11 +42,11 @@ def labelled(at, label):
 def test_demo_accounts_and_usernames(env):
     s = StaffDirectory()
     assert len(s.ensure_demo()) == 4 and s.ensure_demo() == []            # created once, then left alone
-    assert s.check("marcus", "password")["role"] == "supervisor"
-    assert s.check("Admin", "password")["name"] == "Marcus Adeyemi"
-    assert [s.check(n, "password")["role"] for n in ("asha", "Sofia", "ravi@cloudserve.example")] == ["agent"] * 3
-    assert s.check("asha", "nope-nope") is None and s.check("nobody", "password") is None
-    assert "password" not in (env / "staff.json").read_text()                # salted hashes only
+    assert s.check("marcus", DEMO)["role"] == "supervisor"
+    assert s.check("Admin", DEMO)["name"] == "Marcus Adeyemi"
+    assert [s.check(n, DEMO)["role"] for n in ("asha", "Sofia", "ravi@cloudserve.example")] == ["agent"] * 3
+    assert s.check("asha", WRONG) is None and s.check("nobody", DEMO) is None
+    assert DEMO not in (env / "staff.json").read_text()                     # salted hashes only
 
 
 def test_no_demo_accounts_when_turned_off(env, monkeypatch):
@@ -51,8 +54,13 @@ def test_no_demo_accounts_when_turned_off(env, monkeypatch):
     assert StaffDirectory().ensure_demo() == [] and StaffDirectory().list() == []
 
 
+def test_no_demo_accounts_without_a_password_in_env(env, monkeypatch):
+    monkeypatch.delenv("DEMO_PASSWORD")
+    assert StaffDirectory().ensure_demo() == [] and StaffDirectory().list() == []     # nothing falls back to code
+
+
 def test_supervisor_assigns_and_agent_sends_in_streamlit(env):
-    bad = sign_in("marcus", "wrong-password")
+    bad = sign_in("marcus", WRONG)
     assert "Wrong username or password." in [e.value for e in bad.error]
 
     sup = sign_in("marcus")

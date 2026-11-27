@@ -26,6 +26,7 @@ from src.retrieve import Corpus, Retriever, _labelled, approved_threshold_from, 
     score_tickets
 from src.review import ReviewError, approve, reject
 from src.route import Router, RoutingConfig, _label_sets
+from tests import fakes
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data"
@@ -149,7 +150,7 @@ def test_reviewer_can_edit_and_the_edit_is_checked(pipeline):
 @pytest.mark.review_mode
 def test_an_edit_that_leaks_a_secret_or_private_data_is_not_sent(pipeline):
     pipeline.process(ROLLBACK)
-    for leak in ("Use this key instead: sk-live-ABCDEF1234567890ABCDEF1234567890",
+    for leak in (f"Use this key instead: {fakes.api_key(32)}",
                  "Contact our other customer at jane.doe@othercompany.com for their setup."):
         with pytest.raises(ReviewError, match="not sent"):
             approve(pipeline.reviews, pipeline.store, pipeline.guardrails, "R-1", "Sofia Restrepo", leak)
@@ -260,11 +261,11 @@ def test_rejections_and_blocked_edits_are_logged(pipeline):
     pipeline.process(ROLLBACK)
     with pytest.raises(ReviewError):
         approve(pipeline.reviews, pipeline.store, pipeline.guardrails, "R-1", "Sofia",
-                "key: sk-live-ABCDEF1234567890XYZ")
+                f"key: {fakes.api_key(16, 'XYZ')}")
     reject(pipeline.reviews, pipeline.store, "R-1", "Sofia", "wrong product")
     actions = [r["action_taken"] for r in pipeline.store.trail("R-1") if r["stage"] == "review"]
     assert actions == ["blocked", "rejected"]
-    assert "sk-live-ABCDEF1234567890XYZ" not in json.dumps(pipeline.store.trail("R-1"), default=str)
+    assert fakes.api_key(16, "XYZ") not in json.dumps(pipeline.store.trail("R-1"), default=str)
 
 
 @pytest.mark.review_mode

@@ -48,6 +48,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
+from src.query_scope import CONVERSATIONAL       # fixed replies, no ticket (src/scope.py)
+
 log = logging.getLogger("harness")
 
 DEFAULT_TRAIN = "./data/development_tickets.json"
@@ -77,6 +79,7 @@ TARGETS = {
 
 
 # ------------------------------------------------------------------ preparation (development data only)
+
 def prepare(train_path: Path, say: Callable[[str], None]) -> list[str]:
     """Build whatever is missing, from the development set only. Returns what was done."""
     from src import ingest, retrieve, route
@@ -123,7 +126,9 @@ def ticket_row(state: dict, corpus: Any) -> dict:
     kinds = [f.kind for ch in (g.checks if g else []) for f in ch.findings if f.severity == "block"]
     cited = [cid for cl in (a.claims if a else []) for cid in cl.citations]
     return {
-        "ticket_id": t.ticket_id, "outcome": o.outcome, "decided_by": o.decided_by, "reason": o.reason,
+        # A fixed reply (small talk, a clarifying question...) is neither an answer nor an escalation.
+        "ticket_id": t.ticket_id, "outcome": "conversation" if o.decided_by in CONVERSATIONAL else o.outcome,
+        "decided_by": o.decided_by, "reason": o.reason,
         "channel": t.channel.value, "customer_tier": t.customer_tier.value,
         "customer_region": t.customer_region.value, "language_fluency": t.language_fluency.value,
         "processable": t.processable,
@@ -226,6 +231,7 @@ def compute_metrics(rows: list[dict], reconcile: dict) -> dict:
         "by_channel": dict(Counter(r["channel"] for r in rows)),
         "errors": sum(bool(r["error"]) for r in rows),
         "unprocessable_input": sum(not r["processable"] for r in rows),
+        "conversational_replies": sum(r["decided_by"] in CONVERSATIONAL for r in rows),
         "tickets_with_labels": len(lab),
     }
 
@@ -405,8 +411,8 @@ def render_markdown(report: dict) -> str:
                      f"{goal[0]} {_fmt(float(goal[1]) if goal[1] not in ('True', '0') else goal[1], row['metric'])} | "
                      f"{_fmt(row['met'])} |")
     lines += ["", "## Volume", "", "| | |", "|---|---|"]
-    for k in ("tickets_processed", "answered_automatically", "escalated", "blocked_by_guardrails", "errors",
-              "unprocessable_input", "tickets_with_labels"):
+    for k in ("tickets_processed", "answered_automatically", "conversational_replies", "escalated",
+              "blocked_by_guardrails", "errors", "unprocessable_input", "tickets_with_labels"):
         lines.append(f"| {k.replace('_', ' ')} | {v[k]} |")
     lines.append(f"| escalated by | {', '.join(f'{k} {n}' for k, n in v['escalated_by'].items()) or 'none'} |")
     e = m.get("escalations", {})
@@ -549,7 +555,7 @@ def run_harness(input_path: Path, output_dir: Path, *, pipeline: Any = None, pre
             say("interrupted: writing the report for the tickets processed so far")
 
     if judge:
-        judge_rows(rows, records, truth_path, say)
+        judge_rows(rows, records, truth_path, say, corpus=corpus)
     reconcile = store.reconcile(run_id, ids)
     metrics = compute_metrics(rows, reconcile)
     if judge:
@@ -588,10 +594,13 @@ def configuration(pipeline: Any) -> dict:
             "routing": h["routing"], "generator": h["generator"], "kill_switch": h["kill_switch"]}
 
 
-def judge_rows(rows: list[dict], records: list, truth_path: Optional[Path], say: Callable[[str], None]) -> None:
-    """Optional: a model reviews each sent reply (evaluation/judge.py). Needs an API key."""
+def judge_rows(rows: list[dict], records: list, truth_path: Optional[Path], say: Callable[[str], None],
+               corpus: Any = None, judge: Any = None) -> None:
+    """Optional: a model reviews each sent reply (evaluation/judge.py). Needs an API key. The judge is
+    given the passages the reply actually cited, so its 'grounded' verdict checks the reply against
+    the same text the guardrails did."""
     from evaluation.judge import build_judge
-    judge = build_judge()
+    judge = judge or build_judge()
     if judge.client is None:
         say(f"judge skipped: {judge.unavailable_reason}")
         return
@@ -608,7 +617,9 @@ def judge_rows(rows: list[dict], records: list, truth_path: Optional[Path], say:
         row = by_id[rec["ticket_id"]]
         if row["outcome"] != "sent":
             continue
-        row["judge"] = judge.judge(rec, row["reply"] or "", [], truth.get(row["ticket_id"])).model_dump()
+        cited = [corpus.resolve(cid) for cid in row["cited_chunks"]] if corpus is not None else []
+        passages = [{"text": c.text} for c in cited if c is not None]
+        row["judge"] = judge.judge(rec, row["reply"] or "", passages, truth.get(row["ticket_id"])).model_dump()
 
 
 # ------------------------------------------------------------------ command line

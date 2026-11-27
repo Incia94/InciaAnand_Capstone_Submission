@@ -35,6 +35,11 @@ Eight checks, in this order. The first that fails decides the escalation; all ar
 
 If all pass, the ticket is answered automatically.
 
+Before the checks, messages that are not support tickets are handled by src/conversation.py: a
+message that is only small talk gets a fixed reply (action "converse"), a request for a person is
+escalated, and a message with no CloudServe terms that is unlike every past ticket is told what the
+assistant covers instead of being escalated.
+
 The threshold
 -------------
 `calibrate` classifies every development ticket with a classifier that did not see it (two
@@ -78,6 +83,7 @@ from typing import Any, Iterable, Optional, Sequence
 from pydantic import BaseModel
 
 from src.classify import Classification, Classifier, near_duplicate_groups
+from src.conversation import needs_detail, out_of_scope, reply as conversation_reply, small_talk
 from src.ingest import LANGUAGE_NAMES, NormalisedTicket, load_tickets, normalise_ticket
 from src.retrieve import RetrievalResult, intent_doc_map
 
@@ -127,9 +133,11 @@ TOPICS: dict[str, tuple[str, str, str]] = {   # name -> (pattern, team, plain-la
         "incident", "it may be a new service incident, which needs a person to investigate"),
     "billing_dispute": (
         r"\b(?:disput\w*|chargeback|overcharg\w*|charged (?:twice|double|two times)|double[- ]charg\w*"
-        r"|(?:want|need|request|requesting|like) (?:a |our )?refund|refund (?:us|me|the)|money back"
+        r"|(?:want|need|request|requesting|like) (?:a |our )?refund|refund (?:us|me|the|all|my|our)|money back"
+        r"|(?:cancel|close|terminate) (?:my|our) (?:account|subscription|plan|contract)"
         r"|wrong(?:ly)? charged|incorrect(?:ly)? charged|not authori[sz]e[^.]{0,30}charge)",
-        "billing", "it disputes a charge or asks for money back, which only the billing team can decide"),
+        "billing", "it disputes a charge, asks for money back or asks to cancel the account, which only the "
+                   "billing team can decide"),
     "compliance_commitment": (
         r"\b(?:legally binding|certif(?:y|ied|ication)|attest\w*|sign (?:a|our|the|your) (?:dpa|contract|agreement"
         r"|addendum)|\bdpa\b|data processing (?:agreement|addendum)|hipaa|soc ?2|iso ?27001|pci[- ]dss|audit report)",
@@ -241,7 +249,7 @@ class Handoff(BaseModel):
 
 class RoutingDecision(BaseModel):
     ticket_id: str
-    action: str                     # "auto_respond" | "escalate"
+    action: str                     # "auto_respond" | "escalate" | "converse" (small talk, out of scope)
     decided_by: str                 # name of the check that decided, or "all_checks_passed"
     reason: str                     # plain language, for a support manager
     checks: list[Check]
@@ -251,6 +259,7 @@ class RoutingDecision(BaseModel):
     threshold: float
     sources: list[SourceRef]        # the passages an automatic answer must be grounded in
     handoff: Optional[Handoff] = None
+    reply: Optional[str] = None     # the fixed reply, for action "converse" (src/conversation.py)
     config_version: str
     inputs_digest: str              # identical inputs -> identical digest -> identical decision
     latency_ms: float = 0.0
@@ -321,7 +330,8 @@ def _resolution(text: str, limit: int = 600) -> str:
     return _excerpt(body, limit)
 
 
-_CATEGORIES = {"readable": "unreadable", "language": "language", "classified": "unclassified", "policy": "policy",
+_CATEGORIES = {"conversation": "person_requested", "readable": "unreadable", "language": "language",
+               "classified": "unclassified", "policy": "policy",
                "topic": "topic", "documentation": "no_documentation", "confidence": "low_confidence",
                "consistency": "signals_disagree", "generate": "documentation_incomplete",
                "guardrail": "guardrail_block"}
@@ -439,7 +449,72 @@ class Router:
                      detail=f"Company policy: not answered automatically because {TOPICS[name][2]} "
                             f"(the ticket says \"{words}\").")
 
+    def _conversation(self, t: NormalisedTicket, c: Classification,
+                      r: RetrievalResult) -> Optional[RoutingDecision]:
+        """Messages that are not support tickets (src/conversation.py): small talk gets a fixed reply,
+        a request for a person is escalated, an unrelated message is told what the assistant covers.
+        None for everything else, which is routed by the checks as before."""
+        if not t.processable or "plain_text_input" in t.flags:   # malformed input stays with the checks (A11)
+            return None
+        said = t.original_text or t.text
+        st = small_talk(said)
+        english = t.language in ("en", "und") or t.translated
+        vague = st is None and english and needs_detail(said) and not detect_topics(said)
+        if st is None and not vague and not (english and out_of_scope(t.text, c.familiarity)
+                                             and not detect_topics(said)):
+            return None
+        common = dict(ticket_id=t.ticket_id, intent=c.intent, urgency=c.urgency, confidence=c.intent_confidence,
+                      threshold=self.config.confidence_threshold, sources=[], config_version=self.config.version,
+                      inputs_digest=_digest(t, c, r, self.config))
+        readable = Check(name="readable", passed=True, detail="The ticket has readable text.")
+        if st is not None and st.kind == "human":
+            failed = Check(name="conversation", passed=False, detail="The customer asked to speak to a person.")
+            checks = [readable, failed]
+            return RoutingDecision(action="escalate", decided_by="conversation", checks=checks,
+                                   reason="Escalated to a person. The customer asked to speak to a person.",
+                                   handoff=self._handoff(t, c, r, checks, failed, _sources(r)), **common)
+        if st is not None:
+            detail = f"The message is only small talk ({st.kind}), so it gets a short fixed reply."
+            checks = [readable, Check(name="conversation", passed=True, detail=detail)]
+            return RoutingDecision(action="converse", decided_by="small_talk",
+                                   reply=conversation_reply(st.kind, st.language), checks=checks,
+                                   reason="Answered with a fixed reply: the message is small talk, not a support "
+                                          "question.", **common)
+        lang = t.language if t.language in ("es", "fr", "de", "it", "pt") else "en"
+        if vague:
+            detail = ("The message is angry but says nothing specific about what is wrong, so the customer is "
+                      "asked for details before anything is escalated.")
+            checks = [readable, Check(name="conversation", passed=True, detail=detail)]
+            return RoutingDecision(action="converse", decided_by="needs_detail",
+                                   reply=conversation_reply("needs_detail", lang), checks=checks,
+                                   reason="Answered with a fixed reply asking for details: the message says "
+                                          "nothing specific about what is wrong.", **common)
+        detail = ("The message contains no CloudServe terms, so it is outside what support covers.")
+        checks = [readable, Check(name="conversation", passed=True, detail=detail)]
+        return RoutingDecision(action="converse", decided_by="out_of_scope",
+                               reply=conversation_reply("out_of_scope", lang), checks=checks,
+                               reason="Answered with a fixed reply: the message is not about CloudServe, so it was "
+                                      "not escalated.", **common)
+
+    def screened(self, t: NormalisedTicket, s: Any) -> RoutingDecision:
+        """The decision for a message the scope screen recognised (src/scope.py): a fixed reply, made
+        before classification, so it carries no intent or sources. Refused manipulation attempts are
+        marked for review in the decision log."""
+        import hashlib
+        review = f" Flagged for review: {'; '.join(s.flags)}." if s.flags else ""
+        checks = [Check(name="readable", passed=True, detail="The ticket has readable text."),
+                  Check(name="screen", passed=True, detail=f"Intent: {s.intent.value} ({s.kind}). {s.detail}{review}")]
+        digest = hashlib.sha256(f"{t.text}|{s.kind}|{self.config.version}".encode()).hexdigest()[:16]
+        return RoutingDecision(ticket_id=t.ticket_id, action="converse", decided_by=s.intent.value,
+                               reason=f"Answered with a fixed reply, no ticket: {s.detail}{review}", checks=checks,
+                               intent=s.intent.value, urgency="low", confidence=1.0,
+                               threshold=self.config.confidence_threshold, sources=[], reply=s.reply,
+                               config_version=self.config.version, inputs_digest=digest)
+
     def _decide(self, t: NormalisedTicket, c: Classification, r: RetrievalResult) -> RoutingDecision:
+        chat = self._conversation(t, c, r)
+        if chat is not None:
+            return chat
         checks = self._checks(t, c, r)
         failed = next((ch for ch in checks if ch.passed is False), None)
         sources = _sources(r)

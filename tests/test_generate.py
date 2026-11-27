@@ -173,9 +173,12 @@ def test_all_three_prompts_come_from_versioned_files():
     llm = FakeLLM("garbage", GOOD)
     out = G.Generator(llm).generate(TICKET, RETRIEVAL)
     system, user, repair = (G.load_prompt(*p) for p in (G.SYSTEM_PROMPT, G.USER_PROMPT, G.REPAIR_PROMPT))
-    assert out.prompt_version == f"{system.version}+{user.version}+{repair.version}"
+    assert out.prompt_version == f"{system.version}+{user.version}+{repair.version}+{G.CIRRUS_POLICY_VERSION}"
     first = llm.calls[0]
-    assert first[0]["content"] in (system.render(style=""), system.render(style=G.SIMPLE_STYLE))
+    policy, template = first[0]["content"].split("\n\n", 1)
+    assert policy == G.CIRRUS_SUPPORT_POLICY
+    assert template in (system.render(style=""), system.render(style=G.SIMPLE_STYLE))
+    assert llm.calls[1][0]["content"] == first[0]["content"]
     assert first[1]["content"].startswith("PASSAGES (CloudServe documentation")       # from the user template
     assert llm.calls[1][-1]["content"].startswith("Your reply could not be used:")     # from repair_reply
 

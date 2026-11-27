@@ -143,7 +143,9 @@ class SupportPipeline:
     r"""The ticket pipeline as a LangGraph state graph.
 
         START -> ingest --(kill switch on)--> kill_switch ------------------------------\
-                        \-> translate -> classify -> retrieve -> route --(escalate)--> escalate -> finish -> END
+                        \-> screen --(not a support request: src/scope.py)--> converse -----/
+                               \-> translate -> classify -> retrieve -> route --(escalate)--> escalate -> finish -> END
+                                                        \--(small talk / unrelated)--> converse ---/
                                                         \--(auto_respond)--> generate     /
                                          generate --(no answer in the sources)--> escalate
                                          generate --(answered)--> guardrail --(blocked)--> escalate
@@ -178,26 +180,32 @@ class SupportPipeline:
     def _build_graph(self):
         from langgraph.graph import END, START, StateGraph
         g = StateGraph(PipelineState)
-        for name, fn in (("ingest", self._ingest), ("translate", self._translate), ("classify", self._classify),
+        for name, fn in (("ingest", self._ingest), ("screen", self._screen), ("translate", self._translate),
+                         ("classify", self._classify),
                          ("retrieve", self._retrieve),
                          ("route", self._route), ("generate", self._generate), ("guardrail", self._guardrail),
-                         ("send", self._send), ("escalate", self._escalate), ("kill_switch", self._kill_switch),
+                         ("send", self._send), ("escalate", self._escalate), ("converse", self._converse),
+                         ("kill_switch", self._kill_switch),
                          ("error", self._error), ("finish", self._finish)):
             g.add_node(name, self._safe(name, fn) if name not in ("error", "finish") else fn)
         g.add_edge(START, "ingest")
         g.add_conditional_edges("ingest", self._after_ingest,
-                                {"kill_switch": "kill_switch", "translate": "translate", "error": "error"})
+                                {"kill_switch": "kill_switch", "screen": "screen", "error": "error"})
+        g.add_conditional_edges("screen", self._after_screen,
+                                {"converse": "converse", "kill_switch": "kill_switch", "translate": "translate",
+                                 "error": "error"})
         g.add_conditional_edges("translate", self._unless_error("classify"), {"classify": "classify", "error": "error"})
         g.add_conditional_edges("classify", self._unless_error("retrieve"), {"retrieve": "retrieve", "error": "error"})
         g.add_conditional_edges("retrieve", self._unless_error("route"), {"route": "route", "error": "error"})
         g.add_conditional_edges("route", self._after_route,
-                                {"generate": "generate", "escalate": "escalate", "error": "error"})
+                                {"generate": "generate", "escalate": "escalate", "converse": "converse",
+                                 "kill_switch": "kill_switch", "error": "error"})
         g.add_conditional_edges("generate", self._after_generate,
                                 {"guardrail": "guardrail", "escalate": "escalate", "error": "error"})
         g.add_conditional_edges("guardrail", self._after_guardrail,
                                 {"send": "send", "escalate": "escalate", "kill_switch": "kill_switch",
                                  "error": "error"})
-        for name in ("send", "escalate", "kill_switch"):
+        for name in ("send", "escalate", "converse", "kill_switch"):
             g.add_conditional_edges(name, self._unless_error("finish"), {"finish": "finish", "error": "error"})
         g.add_edge("error", "finish")
         g.add_edge("finish", END)
@@ -226,13 +234,24 @@ class SupportPipeline:
     def _after_ingest(state: PipelineState) -> str:
         if state.get("error"):
             return "error"
-        return "kill_switch" if kill_switch_active() else "translate"
+        return "kill_switch" if kill_switch_active() else "screen"
+
+    @staticmethod
+    def _after_screen(state: PipelineState) -> str:
+        if state.get("error"):
+            return "error"
+        if state.get("decision") is not None:              # recognised: a fixed reply, nothing else runs
+            return "kill_switch" if kill_switch_active() else "converse"
+        return "translate"
 
     @staticmethod
     def _after_route(state: PipelineState) -> str:
         if state.get("error"):
             return "error"
-        return "generate" if state["decision"].action == "auto_respond" else "escalate"
+        action = state["decision"].action
+        if action == "converse":
+            return "kill_switch" if kill_switch_active() else "converse"
+        return "generate" if action == "auto_respond" else "escalate"
 
     @staticmethod
     def _after_generate(state: PipelineState) -> str:
@@ -254,6 +273,34 @@ class SupportPipeline:
         t = normalise_ticket(state.get("raw"))
         self.store.log_ingest(t, state.get("run_id"))
         return {"ticket": t, "degraded": []}
+
+    def _screen(self, state: PipelineState) -> dict:
+        """Scope screening (src/scope.py), before any translation, search or model call. Every message
+        gets an intent category, logged as the "screen" stage. Categories that are not support requests
+        (greeting, out of scope, prompt injection, privacy violation, unsafe, ambiguous, frustration,
+        general technical) get a fixed reply and nothing else runs. A mixed message keeps only its
+        support part. Support and requests for a person go on through the pipeline."""
+        from src.query_scope import Intent, classify_scope
+        t = state["ticket"]
+        if not t.processable or "plain_text_input" in t.flags:      # malformed input stays with the checks (A11)
+            return {}
+        s = classify_scope(t.original_text or t.text, t.channel.value, t.conversation, t.language)
+        run_id = state.get("run_id")
+        if s.answered_here:
+            d = self.router.screened(t, s)
+            self.store.log_route(d, t.text, run_id)
+            return {"decision": d}
+        update: dict = {}
+        if s.intent == Intent.MIXED:
+            t = t.model_copy(update={"subject": "", "body": s.cleaned, "text": s.cleaned,
+                                     "word_count": len(s.cleaned.split()),
+                                     "flags": list(t.flags) + ["off_topic_removed"]})
+            update["ticket"] = t
+        elif s.flags:
+            update["ticket"] = t = t.model_copy(update={"flags": list(t.flags) + list(s.flags)})
+        self.store.record(t.ticket_id, "screen", s.intent.value, s.detail, prediction=s.kind, run_id=run_id,
+                          input_text=t.text)
+        return update
 
     def _translate(self, state: PipelineState) -> dict:
         """Non-English tickets: translate into English for classification, search and drafting.
@@ -333,12 +380,26 @@ class SupportPipeline:
         return update
 
     def _send(self, state: PipelineState) -> dict:
+        from src.query_scope import FRUSTRATION_PREFIX, MIXED_PREFIX
         t, c, d, a, out = (state["ticket"], state["classification"], state["decision"], state["answer"],
                            state["outbound"])
+        lead = [p for flag, p in (("customer_frustrated", FRUSTRATION_PREFIX), ("off_topic_removed", MIXED_PREFIX))
+                if flag in t.flags]                       # fixed sentences, outside the model and the guardrails
+        text = "\n\n".join(lead + [out.text])
         return {"outcome": TicketOutcome(
-            ticket_id=t.ticket_id, channel=t.channel.value, outcome="sent", reply=out.text, reason=d.reason,
+            ticket_id=t.ticket_id, channel=t.channel.value, outcome="sent", reply=text, reason=d.reason,
             decided_by=d.decided_by, intent=c.intent, urgency=c.urgency, confidence=c.intent_confidence,
             sources=[s.model_dump() for s in a.sources], guardrail=out.guardrail.model_dump(mode="json"),
+            language=t.language)}
+
+    def _converse(self, state: PipelineState) -> dict:
+        """Small talk or an unrelated message: the router's fixed reply (src/conversation.py). Constant
+        text, no model and no customer text, so there is nothing for the guardrails to check; the
+        decision is logged by the route node and the outcome by finish, like any other reply."""
+        t, d = state["ticket"], state["decision"]
+        return {"outcome": TicketOutcome(
+            ticket_id=t.ticket_id, channel=t.channel.value, outcome="sent", reply=d.reply, reason=d.reason,
+            decided_by=d.decided_by, intent=d.intent, urgency=d.urgency, confidence=d.confidence,
             language=t.language)}
 
     def _escalate(self, state: PipelineState) -> dict:
@@ -368,6 +429,9 @@ class SupportPipeline:
         t, r = state["ticket"], state.get("retrieval")
         if r is None or not t.processable:
             return None
+        d = state.get("decision")
+        if d is not None and d.decided_by == "conversation":         # "talk to a person": nothing to draft
+            return {"status": "not_drafted", "note": "The customer asked for a person; no draft was needed."}
         a = state.get("answer")
         if a is not None and a.status == "insufficient_information":
             return {"status": "not_drafted",

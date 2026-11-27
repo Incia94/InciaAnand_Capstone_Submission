@@ -64,7 +64,7 @@ REQUIREMENT_IDS = {   # PRD functional requirements (FR) and Build Specification
     "retrieve": ["FR-03", "FR-10", "A4"], "route": ["FR-04", "FR-07", "FR-08", "FR-10", "FR-11", "A5"],
     "generate": ["FR-05", "FR-12", "A6"], "guardrail": ["FR-06", "FR-08", "FR-09", "A7"],
     "draft": ["FR-13"], "outcome": ["FR-14", "FR-15", "A8", "A9"], "error": ["FR-16", "A11"],
-    "kill_switch": ["FR-16"],
+    "kill_switch": ["FR-16"], "screen": ["FR-04", "FR-06"],
 }
 
 SCHEMA = """
@@ -157,7 +157,7 @@ def _mask_deep(value: Any) -> Any:
 STAGE_MODEL = {"ingest": "ingest (rules)", "translate": "llm", "classify": "classifier (tf-idf + logistic "
                "regression)", "retrieve": "retriever", "route": "router (rules + threshold)", "generate": "llm",
                "guardrail": "guardrails (rules)", "draft": "llm", "outcome": "pipeline", "error": "pipeline",
-               "kill_switch": "pipeline"}
+               "kill_switch": "pipeline", "screen": "scope screen (rules)"}
 
 
 def _summary(text: Optional[str], limit: int = 200) -> Optional[str]:

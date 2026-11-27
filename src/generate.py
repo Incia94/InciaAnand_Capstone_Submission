@@ -70,6 +70,7 @@ from pydantic import BaseModel, ValidationError, field_validator
 
 from src.ingest import LANGUAGE_NAMES, NormalisedTicket, normalise_ticket
 from src.logging_store import mask_pii
+from src.query_scope import CIRRUS_POLICY_VERSION, CIRRUS_SUPPORT_POLICY, QueryIntent, inspect_query
 from src.retrieve import Passage, RetrievalResult
 
 log = logging.getLogger("generate")
@@ -454,7 +455,9 @@ class Generator:
             self.user_template = load_prompt(*USER_PROMPT, root=prompts_dir)
             self.repair = load_prompt(*REPAIR_PROMPT, root=prompts_dir)
             self.system_prompt = self.system.text
-            self.prompt_version = "+".join(p.version for p in (self.system, self.user_template, self.repair))
+            self.prompt_version = "+".join(
+                [self.system.version, self.user_template.version, self.repair.version, CIRRUS_POLICY_VERSION]
+            )
             self.prompt_ref = "+".join(p.ref for p in (self.system, self.user_template, self.repair))
             self.translate_prompts = {k: load_prompt(*v, root=prompts_dir) for k, v in (
                 ("ticket", TRANSLATE_TICKET), ("ticket_user", TRANSLATE_TICKET_USER),
@@ -544,6 +547,14 @@ class Generator:
         a.answer_text = f"{local}\n\n---\nEnglish version:\n{a.answer_text_en}"
 
     def _generate(self, t: NormalisedTicket, r: RetrievalResult) -> GeneratedAnswer:
+        scope = inspect_query(t.text)
+        if scope.category == QueryIntent.MIXED:
+            text = scope.support_text
+            t = t.model_copy(update={"subject": "", "body": text, "text": text})
+        elif scope.category != QueryIntent.SUPPORT:
+            return self._dont_know(
+                t, generator="none", missing=scope.message or "This request requires human support."
+            )
         passages = list(r.passages[:MAX_PASSAGES])
         if not passages:  # nothing to ground an answer in: say so, do not ask the model to improvise
             return self._dont_know(t, generator="none", missing="No documentation passage matched this ticket.")
@@ -557,6 +568,7 @@ class Generator:
 
         style = SIMPLE_STYLE if (t.language_fluency.value == "non_fluent" or t.translated) else ""
         system = self.system.render(style=style) if "style" in self.system.placeholders else self.system_prompt
+        system = f"{CIRRUS_SUPPORT_POLICY}\n\n{system}"
         messages, labels = build_messages(system, t, passages, self.user_template)
         raw, last_error = "", ""
         for attempt in range(1, MAX_ATTEMPTS + 1):

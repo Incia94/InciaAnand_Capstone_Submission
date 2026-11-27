@@ -101,6 +101,9 @@ _PHRASES = [
     ("how", "it", r"come (?:stai|sta|va)"),
     ("how", "pt", r"tudo bem|como (?:vai|est[aá]s?)"),
     ("thanks", "en", r"thanks?(?: you)?(?: (?:so|very) much)?|thx|ty|cheers|much appreciated|appreciate it"),
+    ("thanks", "en", r"(?:that|it|this|your answer|the fix) (?:worked|works|helped|fixed it|solved it|did it|"
+                     r"did the trick)|(?:it'?s|it is|all|problem|issue) (?:sorted|solved|fixed|resolved|working now)|"
+                     r"works now|working now|all good(?: now)?"),
     ("thanks", "es", r"(?:muchas )?gracias"),
     ("thanks", "fr", r"merci(?: beaucoup)?"),
     ("thanks", "de", r"danke(?: (?:schön|schoen|sehr))?|vielen dank"),
@@ -123,7 +126,7 @@ _PHRASES = [
     ("ack", "en", r"ok(?:ay)?|sure|got it|great|cool|alright|all right|fine|perfect|yes|no|nope|yep|yeah"),
 ]
 _RX = [(k, lang, re.compile(rf"(?<![\w'])(?:{p})(?![\w'])", re.I)) for k, lang, p in _PHRASES]
-_FILLER = set("""there team cloudserve support bot assistant please again all everyone so much very today and
+_FILLER = set("""now there team cloudserve support bot assistant please again all everyone so much very today and
 i im i'm am fine good well you your too to the a an me my we our just there's for ? ! want wanna would like
 i'd can could need let quiero necesito puedo je veux ich möchte""".split())
 _PRIORITY = ["human", "identity", "how", "thanks", "bye", "greet", "ack"]

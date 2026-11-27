@@ -334,7 +334,7 @@ _CATEGORIES = {"conversation": "person_requested", "readable": "unreadable", "la
                "classified": "unclassified", "policy": "policy",
                "topic": "topic", "documentation": "no_documentation", "confidence": "low_confidence",
                "consistency": "signals_disagree", "generate": "documentation_incomplete",
-               "guardrail": "guardrail_block"}
+               "guardrail": "guardrail_block", "channel_policy": "channel_policy"}
 
 
 def _category(check_name: str) -> str:

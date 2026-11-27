@@ -69,7 +69,7 @@ def test_minimum_record_fields_are_logged_for_every_stage(pipeline):
     assert c["prediction"] and 0 <= c["confidence"] <= 1
     assert all({"doc_id", "score"} <= set(s) for s in rows["retrieve"]["sources_used"])
     assert rows["route"]["threshold"] is not None and rows["route"]["action_taken"] == "auto_respond"
-    assert rows["generate"]["prompt_version"].startswith("PR-01 v2+PR-02 v1+PR-03 v1")
+    assert rows["generate"]["prompt_version"].startswith("PR-01 v3+PR-02 v1+PR-03 v1")
     g = rows["guardrail"]["guardrail_results"]
     assert g["pii"] == "pass" and g["grounding"] == "pass" and g["tone"] == "pass" and g["confidence_floor"] == "pass"
 
@@ -111,7 +111,7 @@ def _blocked_kinds(res):
 def test_private_data_blocks_and_never_redacts_and_sends(pipeline, monkeypatch, leak, kind):
     original = pipeline.generator.generate
 
-    def leaky(t, r, purpose="reply"):
+    def leaky(t, r, purpose="reply", **kw):
         a = original(t, r, purpose)
         a.answer_text = a.answer_text.replace(G.CLOSING, G.CLOSING + leak)
         return a
@@ -124,7 +124,7 @@ def test_private_data_blocks_and_never_redacts_and_sends(pipeline, monkeypatch, 
 def test_grounding_block_escalates_with_the_unsupported_claim_flagged(pipeline, monkeypatch):
     original = pipeline.generator.generate
 
-    def invent(t, r, purpose="reply"):
+    def invent(t, r, purpose="reply", **kw):
         a = original(t, r, purpose)
         a.claims[0].text = "Rollbacks are performed by emailing the billing department with a signed form."
         a.answer_text, a.sources = G.render(a.claims, r.passages)

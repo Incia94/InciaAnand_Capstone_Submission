@@ -155,6 +155,8 @@ class NormalisedTicket(BaseModel):
     received_at_raw: str = ""
     customer_id: str = ""
     customer_name: str = Field("", description="for the record only; never placed in `text`")
+    customer_email: str = Field("", description="contact address, for the record only; never placed in `text`")
+    thread_id: str = ""                     # the channel's conversation: email thread, chat session, forum thread
     customer_tier: Tier = Tier.unknown
     customer_region: Region = Region.unknown
     language_fluency: Fluency = Fluency.unknown
@@ -169,6 +171,13 @@ class NormalisedTicket(BaseModel):
     flags: list[str] = []                   # every repair or problem noticed, for the decision log
     eval_labels: Optional[dict] = Field(None, description="evaluation only; never read by the pipeline")
     eval_history: Optional[dict] = Field(None, description="baseline only; never read by the pipeline")
+
+    @property
+    def customer_key(self) -> str:
+        """A stable, non-identifying key for the customer, across channels: a hash of the customer id,
+        or of the contact address when there is no id. "" when neither is known."""
+        ident = (self.customer_id or self.customer_email).strip().lower()
+        return hashlib.sha256(ident.encode("utf-8")).hexdigest()[:16] if ident else ""
 
     def segment(self) -> dict[str, str]:
         """The fairness-audit segments (Dataset Guide, 'The fairness segments')."""
@@ -441,6 +450,8 @@ def normalise_ticket(raw: Any) -> NormalisedTicket:
             received_at_raw=to_str(_get(raw, "received_at"), []),
             customer_id=customer_id,
             customer_name=clean_text(_get(raw, "customer_name"), []),
+            customer_email=to_str(_get(raw, "customer_email"), []).strip().lower(),
+            thread_id=to_str(_get(raw, "thread_id"), []).strip(),
             customer_tier=tier,
             customer_region=region,
             language_fluency=fluency,
@@ -505,6 +516,8 @@ def detect_language(text: str) -> tuple[str, float]:
             share = len(re.findall(pattern, text)) / len(letters)
             if share > 0.3:
                 return code, round(min(1.0, share + 0.2), 2)
+        if "¿" in text or "¡" in text:        # opening marks are used only in Spanish
+            return "es", 0.8
         words = re.findall(r"[a-zà-öø-ÿ]+", text.lower())
         if len(words) < 4:
             return "en", 0.5
@@ -744,6 +757,8 @@ def chunk_document(doc: dict, source_file: str = "", strategy: str = DEFAULT_STR
     related = doc.get("related_docs") or []
     content = normalise_doc_text(str(doc["content"]))
     header = f"{title}\nApplies to: {applies_to}"
+    products = doc_products(applies_to)
+    version = normalise_doc_text(str(doc.get("version") or DEFAULT_DOC_VERSION))
 
     groups = _chunk_groups(content, strategy)
     if not groups:
@@ -767,6 +782,8 @@ def chunk_document(doc: dict, source_file: str = "", strategy: str = DEFAULT_STR
                 "title": title,
                 "category": category,
                 "applies_to": applies_to,
+                "product": products,          # for metadata filtering (src/retrieve.py: filters)
+                "doc_version": version,
                 "section": section,
                 "chunk_index": index,
                 "strategy": strategy,
@@ -778,6 +795,19 @@ def chunk_document(doc: dict, source_file: str = "", strategy: str = DEFAULT_STR
             },
         ))
     return chunks
+
+
+DEFAULT_DOC_VERSION = "1.0"     # documentation.json has no version field yet: every article is 1.0
+ALL_PRODUCTS = "All products"
+
+
+def doc_products(applies_to: str) -> str:
+    """The products an article covers, from its "Applies to" line, comma-separated. Plan names
+    ("All plans", "Business and Enterprise plans") are not products: such articles apply to every
+    product. "Console, CLI, SDK" -> "Console,CLI,SDK"; "All compute services" -> "All products"."""
+    parts = [p.strip() for p in re.split(r",|\band\b", applies_to or "") if p.strip()]
+    products = [p for p in parts if not re.search(r"\bplans?\b|\ball\b|enterprise|business|standard", p, re.I)]
+    return ",".join(products) if products else ALL_PRODUCTS
 
 
 def chunk_corpus(docs: Iterable[dict], source_file: str = "", strategy: str = DEFAULT_STRATEGY) -> list[Chunk]:

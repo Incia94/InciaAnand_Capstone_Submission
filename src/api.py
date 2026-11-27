@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any, Optional, TypedDict
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel
 
@@ -58,7 +58,7 @@ log = logging.getLogger("api")
 class TicketOutcome(BaseModel):
     ticket_id: str
     channel: str
-    outcome: str                         # "sent" | "escalated"
+    outcome: str                         # "sent" | "escalated" | "pending_review" (REPLY_MODE=review) | "merged"
     reply: Optional[str] = None          # the text sent to the customer, if sent
     reason: str                          # plain language, for a support manager
     decided_by: str
@@ -71,6 +71,8 @@ class TicketOutcome(BaseModel):
     language: str = "en"                 # the language the customer wrote in
     guardrail: Optional[dict] = None     # what the guardrails checked and found, if a reply was drafted
     degraded: list[str] = []             # components that ran in backup mode for this ticket
+    tier: int = 3                        # resolution tier (src/policy.py): 0 rules, 1 approved content, 2 RAG,
+    tier_reason: str = ""                # 3 a person
     run_id: Optional[str] = None
     latency_ms: float = 0.0
 
@@ -134,6 +136,7 @@ class PipelineState(TypedDict, total=False):
     answer: Any                    # GeneratedAnswer
     outbound: Any                  # guardrail Outbound
     outcome: TicketOutcome
+    tier: Any                      # src/policy.TierDecision, for tickets routing would answer
     degraded: list[str]
     error_stage: str
     error: str
@@ -164,7 +167,26 @@ class SupportPipeline:
         self.classifier, self.retriever, self.router = classifier, retriever, router
         self.generator, self.guardrails, self.store = generator, guardrails, store
         self.metrics = metrics
+        self._reviews = None
         self.graph = self._build_graph()
+
+    @property
+    def reviews(self):
+        """Replies waiting for a person (src/review.py): REVIEW_DB, else reviews.db beside the decision log."""
+        if self._reviews is None:
+            from src.review import ReviewQueue
+            path = os.getenv("REVIEW_DB") or str(self.store.path.with_name("reviews.db"))
+            self._reviews = ReviewQueue(Path(path))
+        return self._reviews
+
+    def _hold(self, state: PipelineState, outcome: "TicketOutcome", kind: str) -> None:
+        """Put a reply (or an escalation's draft) in the review queue. Never stops the pipeline."""
+        t = state["ticket"]
+        outcome.run_id = state.get("run_id")
+        try:
+            self.reviews.hold(outcome, t.original_text or t.text, kind)
+        except Exception:                      # the decision log still has everything
+            log.exception("could not queue %s for review", outcome.ticket_id)
 
     @classmethod
     def from_env(cls, metrics: Optional[Metrics] = None, store: Optional[DecisionStore] = None) -> "SupportPipeline":
@@ -181,7 +203,7 @@ class SupportPipeline:
         from langgraph.graph import END, START, StateGraph
         g = StateGraph(PipelineState)
         for name, fn in (("ingest", self._ingest), ("screen", self._screen), ("translate", self._translate),
-                         ("classify", self._classify),
+                         ("classify", self._classify), ("tier", self._tier),
                          ("retrieve", self._retrieve),
                          ("route", self._route), ("generate", self._generate), ("guardrail", self._guardrail),
                          ("send", self._send), ("escalate", self._escalate), ("converse", self._converse),
@@ -198,8 +220,10 @@ class SupportPipeline:
         g.add_conditional_edges("classify", self._unless_error("retrieve"), {"retrieve": "retrieve", "error": "error"})
         g.add_conditional_edges("retrieve", self._unless_error("route"), {"route": "route", "error": "error"})
         g.add_conditional_edges("route", self._after_route,
-                                {"generate": "generate", "escalate": "escalate", "converse": "converse",
+                                {"tier": "tier", "escalate": "escalate", "converse": "converse",
                                  "kill_switch": "kill_switch", "error": "error"})
+        g.add_conditional_edges("tier", self._after_tier,
+                                {"generate": "generate", "escalate": "escalate", "error": "error"})
         g.add_conditional_edges("generate", self._after_generate,
                                 {"guardrail": "guardrail", "escalate": "escalate", "error": "error"})
         g.add_conditional_edges("guardrail", self._after_guardrail,
@@ -251,7 +275,13 @@ class SupportPipeline:
         action = state["decision"].action
         if action == "converse":
             return "kill_switch" if kill_switch_active() else "converse"
-        return "generate" if action == "auto_respond" else "escalate"
+        return "tier" if action == "auto_respond" else "escalate"
+
+    @staticmethod
+    def _after_tier(state: PipelineState) -> str:
+        if state.get("error"):
+            return "error"
+        return "escalate" if state["tier"].escalate else "generate"
 
     @staticmethod
     def _after_generate(state: PipelineState) -> str:
@@ -280,7 +310,7 @@ class SupportPipeline:
         (greeting, out of scope, prompt injection, privacy violation, unsafe, ambiguous, frustration,
         general technical) get a fixed reply and nothing else runs. A mixed message keeps only its
         support part. Support and requests for a person go on through the pipeline."""
-        from src.query_scope import Intent, classify_scope
+        from src.scope import Intent, classify_scope
         t = state["ticket"]
         if not t.processable or "plain_text_input" in t.flags:      # malformed input stays with the checks (A11)
             return {}
@@ -296,6 +326,13 @@ class SupportPipeline:
                                      "word_count": len(s.cleaned.split()),
                                      "flags": list(t.flags) + ["off_topic_removed"]})
             update["ticket"] = t
+        elif "follow_up_not_resolved" in s.flags:
+            # the follow-up alone ("still not working") says little: search and classify with the
+            # customer's earlier message in front of it, so the agent gets the right articles
+            before = " ".join(m.get("text", "") for m in t.conversation if m.get("role") in ("customer", None))
+            text = f"{before}\n\n{t.text}".strip()
+            update["ticket"] = t = t.model_copy(update={"text": text, "flags": list(t.flags) + list(s.flags),
+                                                        "word_count": len(text.split())})
         elif s.flags:
             update["ticket"] = t = t.model_copy(update={"flags": list(t.flags) + list(s.flags)})
         self.store.record(t.ticket_id, "screen", s.intent.value, s.detail, prediction=s.kind, run_id=run_id,
@@ -344,9 +381,31 @@ class SupportPipeline:
         self.store.log_route(d, t.text, state.get("run_id"))
         return {"decision": d}
 
+    def _tier(self, state: PipelineState) -> dict:
+        """Tier 1 (approved content) or Tier 2 (RAG) for a ticket routing would answer, within this
+        channel's policy (src/policy.py). When the channel does not allow that reply, a person
+        resolves it with the copilot's preparation (Tier 3)."""
+        from src.policy import decide_tier
+        t, c, r = state["ticket"], state["classification"], state["retrieval"]
+        top = r.passages[0] if r.passages else None
+        replied = any((m or {}).get("role") in ("cirrus", "assistant", "agent") for m in t.conversation)
+        d = decide_tier(t.channel.value, c.intent, top.score if top else 0.0,
+                        self.retriever.approved_threshold(r.backend or "lexical"),
+                        via_hint=bool(top and top.via == "intent_hint"), already_replied=replied,
+                        not_resolved="follow_up_not_resolved" in t.flags)
+        self.store.record(t.ticket_id, "tier", f"tier_{int(d.tier)}", d.reason, prediction=d.policy.label if d.policy
+                          else None, run_id=state.get("run_id"), input_text=t.text)
+        update: dict = {"tier": d}
+        if d.escalate:
+            esc = self.router.escalate_after(t, c, r, "channel_policy", d.reason)
+            self.store.log_route(esc, t.text, state.get("run_id"))
+            update["decision"] = esc
+        return update
+
     def _generate(self, state: PipelineState) -> dict:
+        from src.policy import Tier
         t, r = state["ticket"], state["retrieval"]
-        a = self.generator.generate(t, r)
+        a = self.generator.generate(t, r, approved_only=state["tier"].tier == Tier.RETRIEVAL)
         self.store.log_generate(a, t.text, state.get("run_id"))
         degraded = state.get("degraded", []) + ([f"generator: {a.error}"] if a.degraded else [])
         update = {"answer": a, "degraded": degraded}
@@ -380,17 +439,49 @@ class SupportPipeline:
         return update
 
     def _send(self, state: PipelineState) -> dict:
-        from src.query_scope import FRUSTRATION_PREFIX, MIXED_PREFIX
+        from src.scope import FRUSTRATION_PREFIX, MIXED_PREFIX
         t, c, d, a, out = (state["ticket"], state["classification"], state["decision"], state["answer"],
                            state["outbound"])
         lead = [p for flag, p in (("customer_frustrated", FRUSTRATION_PREFIX), ("off_topic_removed", MIXED_PREFIX))
                 if flag in t.flags]                       # fixed sentences, outside the model and the guardrails
-        text = "\n\n".join(lead + [out.text])
-        return {"outcome": TicketOutcome(
-            ticket_id=t.ticket_id, channel=t.channel.value, outcome="sent", reply=text, reason=d.reason,
+        td = state["tier"]
+        tail = self._suggestions(t, a, td.policy) if td.policy is not None else []
+        text = "\n\n".join(lead + [out.text] + tail)
+        from src.review import reply_mode
+        review = reply_mode() == "review"
+        outcome = TicketOutcome(
+            ticket_id=t.ticket_id, channel=t.channel.value, outcome="pending_review" if review else "sent",
+            reply=text, reason=d.reason + (" Held for a person to approve before sending (REPLY_MODE=review)."
+                                           if review else ""),
             decided_by=d.decided_by, intent=c.intent, urgency=c.urgency, confidence=c.intent_confidence,
             sources=[s.model_dump() for s in a.sources], guardrail=out.guardrail.model_dump(mode="json"),
-            language=t.language)}
+            language=t.language, tier=int(td.tier), tier_reason=td.reason)
+        if review:
+            self._hold(state, outcome, "answer")
+        return {"outcome": outcome}
+
+    def _suggestions(self, t: NormalisedTicket, a: Any, policy: Any) -> list[str]:
+        """Pointers appended to a reply where the channel asks for them: related articles on
+        documentation pages, existing threads on the forum. Titles only: no model, no customer text."""
+        from src.policy import similar_threads
+        out = []
+        cited = {s.doc_id for s in a.sources}
+        if policy.suggest_related or policy.suggest_only:
+            related = []
+            for s_ in a.sources:
+                for c in self.retriever.corpus.chunks:
+                    if c.doc_id == s_.doc_id:
+                        related += [d for d in str(c.metadata.get("related_docs", "")).split(",") if d]
+                        break
+            titles = {c.doc_id: c.metadata.get("title", "") for c in self.retriever.corpus.chunks}
+            related = [d for d in dict.fromkeys(related) if d not in cited and d in titles][:3]
+            if related:
+                out.append("Related articles:\n" + "\n".join(f"- {titles[d]} ({d})" for d in related))
+        if policy.suggest_only:
+            threads = similar_threads(t.text)
+            if threads:
+                out.append("Existing community threads on this:\n" + "\n".join(f"- {th}" for th in threads))
+        return out
 
     def _converse(self, state: PipelineState) -> dict:
         """Small talk or an unrelated message: the router's fixed reply (src/conversation.py). Constant
@@ -400,7 +491,7 @@ class SupportPipeline:
         return {"outcome": TicketOutcome(
             ticket_id=t.ticket_id, channel=t.channel.value, outcome="sent", reply=d.reply, reason=d.reason,
             decided_by=d.decided_by, intent=d.intent, urgency=d.urgency, confidence=d.confidence,
-            language=t.language)}
+            language=t.language, tier=0, tier_reason="Tier 0: rules and approved responses.")}
 
     def _escalate(self, state: PipelineState) -> dict:
         t, d = state["ticket"], state["decision"]
@@ -415,9 +506,10 @@ class SupportPipeline:
         outcome = TicketOutcome(ticket_id=t.ticket_id, channel=t.channel.value, outcome="escalated", reason=d.reason,
                                 decided_by=d.decided_by, intent=d.intent, urgency=d.urgency, confidence=d.confidence,
                                 sources=[s.model_dump() for s in d.sources], handoff=handoff, draft_reply=draft,
-                                language=t.language)
+                                language=t.language, tier=3, tier_reason="Tier 3: human-assisted resolution.")
         if state.get("outbound") is not None:
             outcome.guardrail = state["outbound"].guardrail.model_dump(mode="json")
+        self._hold(state, outcome, "escalation")
         return {"outcome": outcome}
 
     def _agent_draft(self, state: PipelineState) -> Optional[dict]:
@@ -476,10 +568,12 @@ class SupportPipeline:
             handoff["draft_reply"] = draft
         self.store.record(t.ticket_id, "kill_switch", "escalate", detail, run_id=state.get("run_id"),
                           input_text=t.text, details={"stopped_in_flight": draft is not None})
-        return {"outcome": TicketOutcome(
+        outcome = TicketOutcome(
             ticket_id=t.ticket_id, channel=t.channel.value, outcome="escalated",
             reason="Escalated to a person. " + detail, decided_by="kill_switch", handoff=handoff,
-            draft_reply=draft, language=t.language)}
+            draft_reply=draft, language=t.language)
+        self._hold(state, outcome, "escalation")
+        return {"outcome": outcome}
 
     def _error(self, state: PipelineState) -> dict:
         t = state.get("ticket") or normalise_ticket(state.get("raw"))
@@ -617,6 +711,15 @@ TICKET_EXAMPLES = {   # wording taken from development tickets (ids noted), so e
 
 
 # ------------------------------------------------------------------ the FastAPI app
+def hub_of(request: Request):
+    """The support hub over the app's pipeline (src/hub.py), created on first use."""
+    hub = getattr(request.app.state, "hub", None)
+    if hub is None or hub.pipeline is not request.app.state.pipeline:
+        from src.hub import SupportHub
+        request.app.state.hub = SupportHub(request.app.state.pipeline)
+    return request.app.state.hub
+
+
 def create_app(pipeline: Optional[SupportPipeline] = None) -> FastAPI:
     metrics = pipeline.metrics if pipeline and pipeline.metrics else Metrics()
 
@@ -645,10 +748,6 @@ def create_app(pipeline: Optional[SupportPipeline] = None) -> FastAPI:
         status = "down" if problems else ("degraded" if degraded or info["kill_switch"] else "ok")
         return {"status": status, "problems": problems, "degraded": degraded, **info}
 
-    @app.get("/", include_in_schema=False)
-    def root():
-        return RedirectResponse(url="/docs")
-
     @app.post("/tickets", response_model=TicketOutcome, summary="Process one ticket from any channel",
               openapi_extra={"requestBody": {"required": True, "content": {"application/json": {
                   "schema": TICKET_SCHEMA, "examples": TICKET_EXAMPLES}}}})
@@ -660,17 +759,281 @@ def create_app(pipeline: Optional[SupportPipeline] = None) -> FastAPI:
             raw: Any = json.loads(body.decode("utf-8", errors="replace")) if body else {}
         except ValueError:
             raw = body.decode("utf-8", errors="replace")
-        p = request.app.state.pipeline
         metrics.kill_switch.set(1 if kill_switch_active() else 0)
         run_id = request.headers.get("X-Run-Id")
-        return p.process(raw, run_id=run_id)
+        channel = raw.get("channel", "") if isinstance(raw, dict) else ""
+        return hub_of(request).handle(raw, channel if isinstance(channel, str) else "", run_id)[1]
+
+    @app.post("/channels/{channel}", summary="Receive a ticket in a channel's own format (email, chat, forum, "
+                                             "docs_comment)")
+    async def channel_ticket(channel: str, request: Request):
+        from src.channels import CHANNELS
+        if channel not in CHANNELS:
+            return JSONResponse(status_code=404, content={"detail": f"unknown channel {channel!r}; one of {CHANNELS}"})
+        body = await request.body()
+        try:
+            payload: Any = json.loads(body.decode("utf-8", errors="replace")) if body else {}
+        except ValueError:
+            payload = body.decode("utf-8", errors="replace")
+        return hub_of(request).receive(channel, payload, run_id=request.headers.get("X-Run-Id"))
+
+    @app.get("/hub/tickets", summary="Every ticket from every channel (central storage)")
+    def hub_tickets(request: Request, status: Optional[str] = None, channel: Optional[str] = None):
+        return {"tickets": hub_of(request).tickets.list(status, channel)}
+
+    @app.get("/hub/tickets/{ticket_id}", summary="One ticket: conversation, customer history, RAG sources, "
+                                                 "suggested reply, decision trail")
+    def hub_ticket(ticket_id: str, request: Request):
+        view = hub_of(request).ticket_view(ticket_id)
+        if view is None:
+            return JSONResponse(status_code=404, content={"detail": f"no ticket {ticket_id}"})
+        return view
+
+    @app.get("/hub/summary")
+    def hub_summary(request: Request):
+        return hub_of(request).tickets.summary()
+
+    @app.get("/customers/{customer_key}/history", summary="A customer's conversation across all channels")
+    def customer_history(customer_key: str, request: Request):
+        return {"customer_key": customer_key, "messages": hub_of(request).tickets.history(customer_key)}
+
+    @app.post("/hub/simulate", summary="Send simulated traffic from all four channels through the hub")
+    def hub_simulate(request: Request, count: int = 12, seed: int = 7):
+        return {"results": hub_of(request).simulate(count=min(count, 80), seed=seed)}
+
+    # ---------------- the support workspace: sign-in, supervisor and agent screens (src/web/)
+    web = Path(__file__).with_name("web")
+
+    def staff_of(request: Request):
+        if getattr(request.app.state, "staff", None) is None:
+            from src.staff import StaffDirectory
+            request.app.state.staff = StaffDirectory()
+        return request.app.state.staff
+
+    def signed_in(request: Request, role: Optional[str] = None) -> dict:
+        from fastapi import HTTPException
+        from src.staff import COOKIE
+        user = staff_of(request).user_for(request.cookies.get(COOKIE))
+        if user is None:
+            raise HTTPException(status_code=401, detail="please sign in")
+        if role and user["role"] != role:
+            raise HTTPException(status_code=403, detail=f"only a {role} can do this")
+        return user
+
+    def page(request: Request, name: str, role: Optional[str]):
+        from src.staff import COOKIE
+        user = staff_of(request).user_for(request.cookies.get(COOKIE))
+        if role and (user is None or user["role"] != role):
+            return RedirectResponse(url="/")
+        if role is None and user is not None:                   # already signed in: go to their screen
+            return RedirectResponse(url=f"/{user['role']}")
+        return FileResponse(web / name, media_type="text/html")
+
+    @app.get("/", include_in_schema=False)
+    def sign_in_page(request: Request):
+        return page(request, "login.html", None)
+
+    @app.get("/supervisor", include_in_schema=False)
+    def supervisor_page(request: Request):
+        return page(request, "supervisor.html", "supervisor")
+
+    @app.get("/agent", include_in_schema=False)
+    def agent_page(request: Request):
+        return page(request, "agent.html", "agent")
+
+    @app.get("/dashboard", include_in_schema=False)
+    def dashboard():
+        return RedirectResponse(url="/")
+
+    @app.get("/static/{name}", include_in_schema=False)
+    def static(name: str):
+        path = web / Path(name).name
+        if path.suffix not in (".css", ".js") or not path.is_file():
+            return JSONResponse(status_code=404, content={"detail": "not found"})
+        return FileResponse(path, media_type="text/css" if path.suffix == ".css" else "text/javascript")
+
+    @app.post("/staff/login")
+    async def staff_login(request: Request):
+        from src.staff import COOKIE, SESSION_HOURS
+        body = await request.json() if (await request.body()) else {}
+        signed = staff_of(request).sign_in(body.get("email", ""), body.get("password", ""))
+        if signed is None:
+            return JSONResponse(status_code=401, content={"detail": "Wrong email or password."})
+        token, user = signed
+        r = JSONResponse({"user": user, "home": f"/{user['role']}"})
+        r.set_cookie(COOKIE, token, httponly=True, samesite="lax", max_age=SESSION_HOURS * 3600,
+                     secure=request.url.scheme == "https")
+        return r
+
+    @app.post("/staff/logout")
+    def staff_logout(request: Request):
+        from src.staff import COOKIE
+        staff_of(request).sign_out(request.cookies.get(COOKIE))
+        r = JSONResponse({"signed_out": True})
+        r.delete_cookie(COOKIE)
+        return r
+
+    @app.get("/staff/me")
+    def staff_me(request: Request):
+        return signed_in(request)
+
+    # supervisor
+    @app.get("/staff/queue")
+    def staff_queue(request: Request, tab: str = "unassigned"):
+        from src.workspace import queue
+        signed_in(request, "supervisor")
+        return {"tickets": queue(hub_of(request), tab)}
+
+    @app.get("/staff/agents")
+    def staff_agents(request: Request):
+        signed_in(request, "supervisor")
+        return {"agents": staff_of(request).list("agent")}
+
+    @app.post("/staff/tickets/{ticket_id}/assign")
+    async def staff_assign(ticket_id: str, request: Request):
+        sup = signed_in(request, "supervisor")
+        body = await request.json() if (await request.body()) else {}
+        agent = staff_of(request).get(body.get("agent", ""))
+        if agent is None or agent["role"] != "agent":
+            return JSONResponse(status_code=422, content={"detail": "choose an agent"})
+        try:
+            hub_of(request).assign(ticket_id, agent, sup)
+        except LookupError as exc:
+            return JSONResponse(status_code=404, content={"detail": str(exc)})
+        except ValueError as exc:
+            return JSONResponse(status_code=409, content={"detail": str(exc)})
+        return {"assigned": ticket_id, "to": agent}
+
+    @app.get("/staff/reports")
+    def staff_reports(request: Request):
+        from src.workspace import reports
+        signed_in(request, "supervisor")
+        return reports(hub_of(request))
+
+    @app.get("/staff/tickets/{ticket_id}/steps")
+    def staff_steps(ticket_id: str, request: Request):
+        from src.workspace import ticket_steps
+        signed_in(request, "supervisor")
+        return {"ticket_id": ticket_id, "steps": ticket_steps(hub_of(request), ticket_id)}
+
+    @app.post("/staff/sample")
+    def staff_sample(request: Request, count: int = 12):
+        signed_in(request, "supervisor")
+        return {"added": len(hub_of(request).simulate(count=min(count, 40)))}
+
+    # agent (a supervisor may open any ticket to look at it)
+    def own_ticket(request: Request, ticket_id: str, act: bool = False) -> tuple[dict, dict]:
+        from fastapi import HTTPException
+        user = signed_in(request)
+        t = hub_of(request).tickets.get(ticket_id)
+        if t is None:
+            raise HTTPException(status_code=404, detail=f"no ticket {ticket_id}")
+        mine = t.get("assignee") == user["email"]
+        if (act and not mine) or (user["role"] == "agent" and not mine):
+            raise HTTPException(status_code=403, detail="this ticket is not assigned to you")
+        return user, t
+
+    @app.get("/staff/my-tickets")
+    def staff_my_tickets(request: Request):
+        from src.workspace import card
+        user = signed_in(request, "agent")
+        rows = hub_of(request).tickets.assigned_to(user["email"])
+        order = {"open": 0, "in_progress": 0, "resolved": 1}
+        return {"tickets": [card(t) for t in sorted(rows, key=lambda t: order.get(t.get("work_status") or "open"))]}
+
+    @app.get("/staff/tickets/{ticket_id}")
+    def staff_ticket(ticket_id: str, request: Request):
+        from src.workspace import agent_view
+        own_ticket(request, ticket_id)
+        return agent_view(hub_of(request), ticket_id)
+
+    @app.post("/staff/tickets/{ticket_id}/save")
+    async def staff_save(ticket_id: str, request: Request):
+        own_ticket(request, ticket_id, act=True)
+        body = await request.json() if (await request.body()) else {}
+        hub_of(request).save_reply(ticket_id, str(body.get("text", "")))
+        return {"saved": True}
+
+    @app.post("/staff/tickets/{ticket_id}/status")
+    async def staff_status(ticket_id: str, request: Request):
+        own_ticket(request, ticket_id, act=True)
+        body = await request.json() if (await request.body()) else {}
+        try:
+            hub_of(request).set_work_status(ticket_id, body.get("status", ""))
+        except ValueError as exc:
+            return JSONResponse(status_code=422, content={"detail": str(exc)})
+        return {"status": body.get("status")}
+
+    @app.post("/staff/tickets/{ticket_id}/send")
+    async def staff_send(ticket_id: str, request: Request):
+        from src.review import ReviewError
+        user, _ = own_ticket(request, ticket_id, act=True)
+        body = await request.json() if (await request.body()) else {}
+        text = str(body.get("text", "")).strip()
+        if not text:
+            return JSONResponse(status_code=422, content={"detail": "write a reply first"})
+        try:
+            res = hub_of(request).send(ticket_id, user, text)
+        except ReviewError as exc:
+            return JSONResponse(status_code=409 if "already" in str(exc) else 422, content={"detail": str(exc)})
+        return {"sent": True, "edited": res["edited"], "flagged": res["checks"]["warnings"]}
+
+    @app.post("/staff/tickets/{ticket_id}/resolve")
+    async def staff_resolve(ticket_id: str, request: Request):
+        from src.review import ReviewError
+        user, _ = own_ticket(request, ticket_id, act=True)
+        body = await request.json() if (await request.body()) else {}
+        try:
+            return hub_of(request).resolve_without_reply(ticket_id, user, str(body.get("note", "")))
+        except ReviewError as exc:
+            return JSONResponse(status_code=409, content={"detail": str(exc)})
 
     @app.get("/tickets/{ticket_id}/decisions")
-    def decisions(ticket_id: str, request: Request):
-        trail = request.app.state.pipeline.store.trail(ticket_id)
+    def decisions(ticket_id: str, request: Request, format: str = "governance"):
+        """Every decision for the ticket, in the governance record format (or format=raw: the log's columns)."""
+        store = request.app.state.pipeline.store
+        trail = store.trail(ticket_id) if format == "raw" else store.export(ticket_id=ticket_id)
         if not trail:
             return JSONResponse(status_code=404, content={"detail": f"no decisions logged for {ticket_id}"})
         return {"ticket_id": ticket_id, "decisions": trail}
+
+    @app.get("/search", summary="Search the documentation; results come with numbered citations")
+    def search(request: Request, q: str, category: Optional[str] = None, product: Optional[str] = None,
+               doc_version: Optional[str] = None, k: int = 5):
+        from src.retrieve import cited_results
+        p = request.app.state.pipeline
+        filters = {key: [v.strip() for v in val.split(",") if v.strip()] for key, val in
+                   (("category", category), ("product", product), ("doc_version", doc_version)) if val}
+        return cited_results(p.retriever, q, filters=filters or None, k=k, store=p.store)
+
+    @app.get("/reviews", summary="Replies waiting for a person to approve")
+    def reviews(request: Request, status: str = "pending"):
+        return {"items": request.app.state.pipeline.reviews.list(None if status == "all" else status)}
+
+    @app.get("/reviews/{ticket_id}")
+    def review_item(ticket_id: str, request: Request):
+        item = request.app.state.pipeline.reviews.get(ticket_id)
+        if item is None:
+            return JSONResponse(status_code=404, content={"detail": f"no review item for {ticket_id}"})
+        return item
+
+    @app.post("/reviews/{ticket_id}/approve", summary="Send the held reply, as written or edited")
+    async def review_approve(ticket_id: str, request: Request):
+        from src.review import ReviewError
+        body = await request.json() if (await request.body()) else {}
+        try:
+            return hub_of(request).approve(ticket_id, body.get("reviewer", ""), body.get("text"))
+        except ReviewError as exc:
+            return JSONResponse(status_code=409 if "already" in str(exc) else 422, content={"detail": str(exc)})
+
+    @app.post("/reviews/{ticket_id}/reject", summary="Send nothing; an agent answers from scratch")
+    async def review_reject(ticket_id: str, request: Request):
+        from src.review import ReviewError
+        body = await request.json() if (await request.body()) else {}
+        try:
+            return hub_of(request).reject(ticket_id, body.get("reviewer", ""), body.get("reason", ""))
+        except ReviewError as exc:
+            return JSONResponse(status_code=409 if "already" in str(exc) else 422, content={"detail": str(exc)})
 
     @app.get("/metrics")
     def prometheus_metrics():

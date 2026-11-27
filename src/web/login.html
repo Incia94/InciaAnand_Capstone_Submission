@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cirrus AI · Sign in</title>
+<link rel="stylesheet" href="/static/app.css">
+<style>
+  .box { max-width:380px; margin:70px auto; } .box h1 { text-align:center; margin:0; font-size:26px; }
+  .box h2 { text-align:center; margin:4px 0 20px; font-size:17px; font-weight:500; color:var(--muted); }
+  label { display:block; font-size:14px; margin:12px 0 4px; } .box button { width:100%; margin-top:18px; padding:10px; }
+</style>
+</head>
+<body>
+<div class="bar"><div class="brand">Cirrus AI <span>| Support workspace</span></div><div class="grow"></div>
+  <div class="who">CloudServe</div></div>
+<form class="card box" id="form">
+  <h1>Cirrus AI</h1><h2>Staff sign-in</h2>
+  <label for="email">Work email</label><input id="email" type="email" autocomplete="username" required>
+  <label for="password">Password</label><input id="password" type="password" autocomplete="current-password" required>
+  <button class="primary" type="submit">Sign in</button>
+  <p id="error" class="bad small" role="alert"></p>
+  <p class="muted small">Supervisors see every ticket and assign them. Agents see the tickets assigned to them.</p>
+</form>
+<script src="/static/app.js"></script>
+<script>
+$("form").onsubmit = async (e) => {
+  e.preventDefault(); $("error").textContent = "";
+  try {
+    const r = await fetch("/staff/login", {method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({email: $("email").value, password: $("password").value})});
+    const body = await r.json();
+    if (!r.ok) throw new Error(body.detail || "Could not sign in.");
+    location.href = body.home;
+  } catch (err) { $("error").textContent = err.message; }
+};
+</script>
+</body>
+</html>

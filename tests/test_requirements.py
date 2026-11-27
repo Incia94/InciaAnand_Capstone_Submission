@@ -111,7 +111,7 @@ def test_1_default_search_combines_meaning_and_wording(parts):
 
 # ---------------------------------------------------------------- 2 every automated reply cites an article
 def test_2_every_sent_reply_cites_at_least_one_article(pipeline, val):
-    from src.query_scope import CONVERSATIONAL           # fixed replies (a clarifying question) cite nothing
+    from src.scope import CONVERSATIONAL           # fixed replies (a clarifying question) cite nothing
     sent = [o for o in (pipeline.process(t) for t in val) if o.outcome == "sent" and o.decided_by not in
             CONVERSATIONAL]
     assert sent
@@ -239,6 +239,7 @@ def test_6_decision_log_holds_no_raw_personal_data(pipeline):
 # ---------------------------------------------------------------- 7 findability vs genuine escalations
 def test_7_intent_hint_turns_findability_escalations_into_answers(parts, tmp_path, monkeypatch, val):
     monkeypatch.setenv("KILL_SWITCH_FILE", str(tmp_path / "KS"))
+    monkeypatch.setenv("CHANNEL_POLICY", "uniform")      # findability only: no channel holding replies back
     avoidable = {}
     for hint in (False, True):
         (tmp_path / str(hint)).mkdir()
@@ -256,7 +257,8 @@ def test_7_intent_hint_turns_findability_escalations_into_answers(parts, tmp_pat
 def test_7_escalations_say_whether_they_are_findability_or_genuine(pipeline, val):
     cats = {o.handoff["escalation_category"] for o in (pipeline.process(t) for t in val) if o.outcome == "escalated"}
     assert cats <= {"policy", "topic", "no_documentation", "low_confidence", "signals_disagree",
-                    "documentation_incomplete", "guardrail_block", "language", "unclassified", "unreadable"}
+                    "documentation_incomplete", "guardrail_block", "language", "unclassified", "unreadable",
+                    "channel_policy"}
 
 
 # ---------------------------------------------------------------- 8 the handoff

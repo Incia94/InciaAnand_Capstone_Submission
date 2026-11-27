@@ -64,7 +64,8 @@ REQUIREMENT_IDS = {   # PRD functional requirements (FR) and Build Specification
     "retrieve": ["FR-03", "FR-10", "A4"], "route": ["FR-04", "FR-07", "FR-08", "FR-10", "FR-11", "A5"],
     "generate": ["FR-05", "FR-12", "A6"], "guardrail": ["FR-06", "FR-08", "FR-09", "A7"],
     "draft": ["FR-13"], "outcome": ["FR-14", "FR-15", "A8", "A9"], "error": ["FR-16", "A11"],
-    "kill_switch": ["FR-16"], "screen": ["FR-04", "FR-06"],
+    "kill_switch": ["FR-16"], "screen": ["FR-04", "FR-06"], "tier": ["FR-04", "FR-05"],
+    "review": ["FR-13", "FR-15"], "search": ["FR-03"], "dedup": ["FR-01"], "assignment": ["FR-15"],
 }
 
 SCHEMA = """
@@ -157,7 +158,9 @@ def _mask_deep(value: Any) -> Any:
 STAGE_MODEL = {"ingest": "ingest (rules)", "translate": "llm", "classify": "classifier (tf-idf + logistic "
                "regression)", "retrieve": "retriever", "route": "router (rules + threshold)", "generate": "llm",
                "guardrail": "guardrails (rules)", "draft": "llm", "outcome": "pipeline", "error": "pipeline",
-               "kill_switch": "pipeline", "screen": "scope screen (rules)"}
+               "kill_switch": "pipeline", "screen": "scope screen (rules)",
+               "tier": "tier and channel policy (rules)", "review": "person", "search": "retriever",
+               "dedup": "deduplication (same customer, TF-IDF similarity)", "assignment": "person"}
 
 
 def _summary(text: Optional[str], limit: int = 200) -> Optional[str]:
@@ -416,13 +419,20 @@ class DecisionStore:
         return out
 
     def reconcile(self, run_id: str, ticket_ids: Optional[Iterable[str]] = None) -> dict:
-        """Do the logged decisions account for every ticket processed in this run? (A8)"""
+        """Do the logged decisions account for every ticket processed in this run? (A8)
+
+        Coverage is checked two ways. Counts: every processed ticket has exactly one outcome.
+        Paths: every ticket's trail holds the decisions its path requires, so no route through the
+        system decides without recording it: an ingest record for every ticket; a routing record for
+        every ticket that was answered; a validation (guardrail) record for every generated reply; and
+        no answer sent after validation blocked it. Any gap makes the run not reconciled."""
         rows = [r for r in self._rows("WHERE run_id = ?", (run_id,)) if r.get("run_id") == run_id]
         outcomes = Counter(r["ticket_id"] for r in rows if r["stage"] == "outcome")
         seen = set(r["ticket_id"] for r in rows)
         expected = list(ticket_ids) if ticket_ids is not None else sorted(seen)
         missing = [t for t in expected if outcomes.get(t, 0) == 0]
         duplicated = [t for t, n in outcomes.items() if n > 1]
+        path_gaps = self._path_gaps(rows)
         return {
             "run_id": run_id, "tickets_expected": len(expected), "tickets_with_outcome": len(outcomes),
             "decisions": len(rows), "by_stage": dict(Counter(r["stage"] for r in rows)),
@@ -430,8 +440,48 @@ class DecisionStore:
             "missing_outcome": missing, "duplicate_outcome": duplicated,
             "unexpected_tickets": sorted(set(outcomes) - set(expected)) if ticket_ids is not None else [],
             "write_failures": self.write_failures,
-            "reconciled": not missing and not duplicated,
+            "path_gaps": path_gaps,
+            "decisions_per_ticket": round(len(rows) / len(seen), 2) if seen else 0.0,
+            "reconciled": not missing and not duplicated and not path_gaps,
         }
+
+    @staticmethod
+    def _path_gaps(rows: Sequence[dict]) -> list[dict]:
+        by: dict[str, list[dict]] = {}
+        for r in rows:
+            by.setdefault(r["ticket_id"], []).append(r)
+        gaps = []
+        for tid, trail in by.items():
+            stages = [r["stage"] for r in trail]
+            if "outcome" not in stages:
+                continue                                        # counted as missing_outcome
+            outcome = next(r["action_taken"] for r in trail if r["stage"] == "outcome")
+            replies = [r for r in trail if r["stage"] == "generate"
+                       and (_decode(r.get("details")) or {}).get("purpose", "reply") != "agent_draft"]
+            checks = [r for r in trail if r["stage"] == "guardrail"]
+            if "ingest" not in stages:
+                gaps.append({"ticket_id": tid, "gap": "no ingest record"})
+            if outcome in ("sent", "pending_review") and "route" not in stages:
+                gaps.append({"ticket_id": tid, "gap": "answered without a routing record"})
+            if replies and not checks:
+                gaps.append({"ticket_id": tid, "gap": "a reply was generated without a validation record"})
+            if outcome in ("sent", "pending_review") and replies and checks and checks[-1]["action_taken"] != "release":
+                gaps.append({"ticket_id": tid, "gap": "answered although validation blocked the reply"})
+        return gaps
+
+    def export(self, run_id: Optional[str] = None, ticket_id: Optional[str] = None) -> list[dict]:
+        """Decisions in the governance record format (governance_record), oldest first."""
+        where, params = [], []
+        if run_id:
+            where.append("run_id = ?")
+            params.append(run_id)
+        if ticket_id:
+            where.append("ticket_id = ?")
+            params.append(ticket_id)
+        rows = self._rows(("WHERE " + " AND ".join(where)) if where else "", params)
+        rows = [r for r in rows if (not run_id or r.get("run_id") == run_id)
+                and (not ticket_id or r.get("ticket_id") == ticket_id)]
+        return [governance_record(r) for r in rows]
 
     def summary(self) -> dict:
         rows = self._rows()
@@ -444,6 +494,55 @@ class DecisionStore:
 
 def new_run_id(prefix: str = "run") -> str:
     return f"{prefix}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:6]}"
+
+
+# ------------------------------------------------------------------ the governance record format
+STAGE_NAMES = {"ingest": "ingestion", "screen": "screening", "translate": "translation",
+               "classify": "classification", "retrieve": "retrieval", "route": "routing", "tier": "tiering",
+               "generate": "generation", "guardrail": "validation", "draft": "agent_draft", "outcome": "outcome",
+               "review": "human_review", "kill_switch": "kill_switch", "error": "error", "search": "search",
+               "dedup": "deduplication", "assignment": "assignment"}
+_ACTIONS = {("route", "converse"): "auto_respond", ("guardrail", "release"): "auto_respond",
+            ("guardrail", "block"): "block", ("review", "blocked"): "block"}
+
+
+def _decode(value: Any) -> Any:
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except ValueError:
+            return value
+    return value
+
+
+def governance_record(r: dict) -> dict:
+    """One logged decision in the Governance Framework's record format. stage uses the framework's
+    names (classification, routing, generation, validation...); action_taken is auto_respond,
+    escalate or block where the stage decides that, and the stage's own action otherwise.
+    prompt_version and requirement_ids say which prompt and which requirement produced it, so
+    "was this behaviour intended?" can be answered from the record alone."""
+    sources = _decode(r.get("sources_used")) or []
+    alternatives = _decode(r.get("alternatives")) or []
+    return {
+        "decision_id": r.get("decision_id"),
+        "timestamp": r.get("created_at"),
+        "ticket_id": r.get("ticket_id"),
+        "run_id": r.get("run_id"),
+        "stage": STAGE_NAMES.get(r.get("stage"), r.get("stage")),
+        "input_summary": r.get("input_summary"),
+        "model": {"name": r.get("model_name"), "version": r.get("model_version")},
+        "prediction": {"value": r.get("prediction"), "confidence": r.get("confidence")},
+        "alternatives": [{"value": a.get("value"), "confidence": a.get("confidence")} for a in alternatives
+                         if isinstance(a, dict)],
+        "sources_used": [{"doc_id": s_.get("doc_id"), "score": s_.get("score")} for s_ in sources
+                         if isinstance(s_, dict)],
+        "threshold_applied": r.get("threshold"),
+        "action_taken": _ACTIONS.get((r.get("stage"), r.get("action_taken")), r.get("action_taken")),
+        "reason": r.get("reason"),
+        "guardrail_results": _decode(r.get("guardrail_results")),
+        "prompt_version": r.get("prompt_version"),
+        "requirement_ids": _decode(r.get("requirement_ids")) or [],
+    }
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -460,12 +559,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     r = sub.add_parser("reconcile", help="check decisions against tickets for one run")
     r.add_argument("--run-id", required=True)
     sub.add_parser("summary", help="counts by stage")
+    ex = sub.add_parser("export", help="decisions in the governance record format, one JSON object per line")
+    ex.add_argument("--run-id")
+    ex.add_argument("--ticket-id")
     args = p.parse_args(argv)
     store = DecisionStore(args.db)
     if args.command == "trail":
         print(json.dumps(store.trail(args.ticket_id), indent=2, ensure_ascii=False))
     elif args.command == "reconcile":
-        print(json.dumps(store.reconcile(args.run_id), indent=2))
+        rep = store.reconcile(args.run_id)
+        print(json.dumps(rep, indent=2))
+        return 0 if rep["reconciled"] else 2
+    elif args.command == "export":
+        for rec in store.export(args.run_id, args.ticket_id):
+            print(json.dumps(rec, ensure_ascii=False, default=str))
     else:
         print(json.dumps(store.summary(), indent=2))
     return 0

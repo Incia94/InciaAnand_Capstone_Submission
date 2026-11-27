@@ -278,7 +278,9 @@ def test_calibrate_writes_thresholds(tmp_path, corpus, dev):
 def test_cli_search_and_compare(tmp_path, capsys, monkeypatch):
     monkeypatch.setenv("CHROMA_PATH", str(tmp_path / "missing"))
     assert R.main(["--backend", "lexical", "search", "429 too many requests"]) == 0
-    assert '"status"' in capsys.readouterr().out
+    assert "[1] Understanding API rate limits" in capsys.readouterr().out          # readable, with citations
+    assert R.main(["--backend", "lexical", "search", "429 too many requests", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["results"][0]["citation"] == "[1]"
     assert R.main(["--backend", "lexical", "compare", "--output", str(tmp_path / "c.json")]) == 0
     assert json.loads((tmp_path / "c.json").read_text())["recommended"] == "document"
 

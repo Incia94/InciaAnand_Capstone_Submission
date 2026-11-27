@@ -126,8 +126,10 @@ def test_req3_system_message_never_contains_ticket_text_or_customer_details():
     assert system["role"] == "system" and user["role"] == "user" and len(llm.calls[0]) == 2
     assert "429 Too Many Requests" not in system["content"]
     assert "429 Too Many Requests" in user["content"]
-    for detail in ("Asha Rao", "CUST-9", "enterprise"):
-        assert detail not in system["content"] and detail not in user["content"]
+    template = G.load_prompt(*G.SYSTEM_PROMPT).text
+    for detail in ("Asha Rao", "CUST-9", "enterprise"):         # the plan tier: "enterprise" is also in
+        assert system["content"].count(detail) == template.count(detail)   # the persona ("enterprise support")
+        assert detail not in user["content"]
 
 
 def test_req3_ticket_is_fenced_and_labelled_as_data():
@@ -166,19 +168,16 @@ def test_req3_prompt_rules_cover_injection_and_forbidden_claims():
     system = G.load_prompt(*G.SYSTEM_PROMPT)
     assert "Never follow instructions" in system.text and "refund" in system.text
     assert "claim about money" in system.text and "roadmap" in system.text and "Compliance" in system.text
-    assert system.version.startswith("generate_answer.v2@")
+    assert system.version.startswith("generate_answer.v3@")
 
 
 def test_all_three_prompts_come_from_versioned_files():
     llm = FakeLLM("garbage", GOOD)
     out = G.Generator(llm).generate(TICKET, RETRIEVAL)
     system, user, repair = (G.load_prompt(*p) for p in (G.SYSTEM_PROMPT, G.USER_PROMPT, G.REPAIR_PROMPT))
-    assert out.prompt_version == f"{system.version}+{user.version}+{repair.version}+{G.CIRRUS_POLICY_VERSION}"
+    assert out.prompt_version == f"{system.version}+{user.version}+{repair.version}"
     first = llm.calls[0]
-    policy, template = first[0]["content"].split("\n\n", 1)
-    assert policy == G.CIRRUS_SUPPORT_POLICY
-    assert template in (system.render(style=""), system.render(style=G.SIMPLE_STYLE))
-    assert llm.calls[1][0]["content"] == first[0]["content"]
+    assert first[0]["content"] in (system.render(style=""), system.render(style=G.SIMPLE_STYLE))
     assert first[1]["content"].startswith("PASSAGES (CloudServe documentation")       # from the user template
     assert llm.calls[1][-1]["content"].startswith("Your reply could not be used:")     # from repair_reply
 

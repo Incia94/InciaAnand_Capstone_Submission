@@ -70,7 +70,6 @@ from pydantic import BaseModel, ValidationError, field_validator
 
 from src.ingest import LANGUAGE_NAMES, NormalisedTicket, normalise_ticket
 from src.logging_store import mask_pii
-from src.query_scope import CIRRUS_POLICY_VERSION, CIRRUS_SUPPORT_POLICY, QueryIntent, inspect_query
 from src.retrieve import Passage, RetrievalResult
 
 log = logging.getLogger("generate")
@@ -99,7 +98,7 @@ _FENCE = re.compile(r"<\s*/?\s*(customer_ticket|passages?|system|instructions)\b
 # judge output), named <name>.v<N>.txt. Each caller pins the version it loads; PROMPT_<NAME>=vN in
 # the environment selects another version for a trial run without a code change.
 PROMPTS_DIR = Path(__file__).resolve().parents[1] / "prompts"
-SYSTEM_PROMPT = ("generate_answer", 2)        # prompts/build/generate_answer.v2.txt
+SYSTEM_PROMPT = ("generate_answer", 3)        # prompts/build/generate_answer.v3.txt
 USER_PROMPT = ("generate_answer_user", 1)     # prompts/build/generate_answer_user.v1.txt
 REPAIR_PROMPT = ("repair_reply", 1)           # prompts/build/repair_reply.v1.txt
 TRANSLATE_TICKET = ("translate_ticket", 1)            # prompts/build/translate_ticket.v1.txt
@@ -455,9 +454,7 @@ class Generator:
             self.user_template = load_prompt(*USER_PROMPT, root=prompts_dir)
             self.repair = load_prompt(*REPAIR_PROMPT, root=prompts_dir)
             self.system_prompt = self.system.text
-            self.prompt_version = "+".join(
-                [self.system.version, self.user_template.version, self.repair.version, CIRRUS_POLICY_VERSION]
-            )
+            self.prompt_version = "+".join(p.version for p in (self.system, self.user_template, self.repair))
             self.prompt_ref = "+".join(p.ref for p in (self.system, self.user_template, self.repair))
             self.translate_prompts = {k: load_prompt(*v, root=prompts_dir) for k, v in (
                 ("ticket", TRANSLATE_TICKET), ("ticket_user", TRANSLATE_TICKET_USER),
@@ -469,12 +466,22 @@ class Generator:
             self.client = None
             self.unavailable_reason = f"prompt file missing: {exc}"
 
-    def generate(self, ticket: Any, retrieval: RetrievalResult, purpose: str = "reply") -> GeneratedAnswer:
-        """Never raises. purpose="agent_draft" drafts a reply for a person to review and send."""
+    def generate(self, ticket: Any, retrieval: RetrievalResult, purpose: str = "reply",
+                 approved_only: bool = False) -> GeneratedAnswer:
+        """Never raises. purpose="agent_draft" drafts a reply for a person to review and send.
+        approved_only=True is Tier 1 (src/policy.py): the article's own resolution steps, cited, with
+        no model call."""
         started = time.perf_counter()
         t = ticket if isinstance(ticket, NormalisedTicket) else normalise_ticket(ticket)
         try:
-            out = self._generate(t, retrieval)
+            if approved_only and retrieval.passages:
+                out = self._extractive(t, list(retrieval.passages[:MAX_PASSAGES]),
+                                       "Tier 1: approved documentation content, no model call")
+                if out.status == "answered":
+                    out.degraded, out.error = False, ""
+                    out.data_policy = self.blocked_region(t)      # recorded, though no model is called
+            else:
+                out = self._generate(t, retrieval)
             if out.status == "answered":
                 self._localise(t, out)
         except Exception as exc:  # last line of defence
@@ -547,14 +554,6 @@ class Generator:
         a.answer_text = f"{local}\n\n---\nEnglish version:\n{a.answer_text_en}"
 
     def _generate(self, t: NormalisedTicket, r: RetrievalResult) -> GeneratedAnswer:
-        scope = inspect_query(t.text)
-        if scope.category == QueryIntent.MIXED:
-            text = scope.support_text
-            t = t.model_copy(update={"subject": "", "body": text, "text": text})
-        elif scope.category != QueryIntent.SUPPORT:
-            return self._dont_know(
-                t, generator="none", missing=scope.message or "This request requires human support."
-            )
         passages = list(r.passages[:MAX_PASSAGES])
         if not passages:  # nothing to ground an answer in: say so, do not ask the model to improvise
             return self._dont_know(t, generator="none", missing="No documentation passage matched this ticket.")
@@ -568,7 +567,6 @@ class Generator:
 
         style = SIMPLE_STYLE if (t.language_fluency.value == "non_fluent" or t.translated) else ""
         system = self.system.render(style=style) if "style" in self.system.placeholders else self.system_prompt
-        system = f"{CIRRUS_SUPPORT_POLICY}\n\n{system}"
         messages, labels = build_messages(system, t, passages, self.user_template)
         raw, last_error = "", ""
         for attempt in range(1, MAX_ATTEMPTS + 1):

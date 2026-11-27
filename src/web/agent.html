@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cirrus AI · My tickets</title>
+<link rel="stylesheet" href="/static/app.css">
+<style>
+  .layout { display:grid; grid-template-columns: 380px 1fr; min-height:calc(100vh - 56px); }
+  .side { background:#fff; border-right:1px solid var(--line); padding:18px; }
+  .side h2 { margin:0 0 12px; } .filters { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin:10px 0; }
+  .item { display:grid; grid-template-columns:1fr auto; gap:4px 10px; padding:12px; border-bottom:1px solid var(--line);
+          cursor:pointer; border-left:4px solid transparent; }
+  .item:hover { background:#f8f9fb; } .item.on { background:var(--blue-soft); border-left-color:var(--blue); }
+  .item b { font-size:15px; } .main { padding:20px 26px; max-width:980px; }
+  .head { display:flex; align-items:flex-start; gap:12px; } .head h1 { margin:0; font-size:26px; flex:1; }
+  .head select { width:auto; background:var(--blue-soft); color:var(--blue); border-color:#cddcf7; font-weight:600; }
+  .actions { display:flex; gap:10px; justify-content:flex-end; margin-top:12px; }
+</style>
+</head>
+<body>
+<div class="bar"><div class="brand">Cirrus AI <span>| Support workspace</span></div><div class="grow"></div>
+  <div class="who" id="who"></div><button id="signout">Sign out</button></div>
+<div class="layout">
+  <aside class="side">
+    <h2>My tickets</h2>
+    <input id="search" placeholder="Search tickets">
+    <div class="filters">
+      <select id="f-status"><option value="active">Open and in progress</option><option value="">All</option>
+        <option value="Resolved">Resolved</option></select>
+      <select id="f-channel"><option value="">All channels</option><option>Email</option><option>Live chat</option>
+        <option>Forum</option><option>Docs comment</option></select>
+    </div>
+    <div id="list"></div>
+  </aside>
+  <main class="main" id="ticket"><p class="muted">Select a ticket.</p></main>
+</div>
+
+<script src="/static/app.js"></script>
+<script>
+let tickets = [], current = null;
+
+function showList() {
+  const q = $("search").value.trim().toLowerCase(), st = $("f-status").value, ch = $("f-channel").value;
+  const rows = tickets.filter(t => (!q || (t.title + t.ticket_id + t.customer).toLowerCase().includes(q))
+    && (!ch || t.channel === ch) && (!st || (st === "active" ? t.work_status !== "Resolved" : t.work_status === st)));
+  $("list").innerHTML = rows.length ? rows.map(t => `
+    <div class="item ${t.ticket_id === current ? "on" : ""}" data-id="${esc(t.ticket_id)}">
+      <b>${esc(t.title)}</b><span class="chip ${esc(t.priority)}">${esc(t.priority)}</span>
+      <span class="muted small">#${esc(t.ticket_id)} · ${esc(t.channel)}</span><span class="muted small">${esc(t.age)}</span>
+      <span class="small">${esc(t.work_status)}</span></div>`).join("")
+    : `<p class="empty">No tickets here. Your supervisor assigns tickets to you.</p>`;
+  document.querySelectorAll(".item").forEach(i => i.onclick = () => open(i.dataset.id));
+}
+
+async function loadList() { tickets = (await api("/staff/my-tickets")).tickets; showList(); }
+
+async function open(id) {
+  current = id; showList();
+  const t = await api("/staff/tickets/" + encodeURIComponent(id));
+  const done = !t.can_send;
+  $("ticket").innerHTML = `
+    <div class="head"><div style="flex:1"><h1>${esc(t.title)}</h1>
+        <div class="muted">#${esc(t.ticket_id)} · ${esc(t.channel)} · ${esc(t.customer)} · <span class="chip ${esc(t.priority)}">${esc(t.priority)}</span></div></div>
+      ${done ? statusChip("Resolved") : `<select id="status"><option value="open">Open</option>
+        <option value="in_progress">In progress</option></select>`}</div>
+
+    <div class="card" style="margin-top:16px"><h3>Customer report</h3><div style="white-space:pre-wrap">${esc(t.customer_report)}</div>
+      ${t.conversation.length > 1 ? `<details style="margin-top:8px"><summary class="small">Conversation (${t.conversation.length} messages)</summary>
+        ${t.conversation.map(m => `<div class="msg"><div class="w">${esc(m.from)} · ${esc(m.channel)}</div>${esc(m.text)}</div>`).join("")}</details>` : ""}</div>
+
+    <div class="card finding"><h3>ⓘ Cirrus findings</h3><div>${esc(t.findings)}</div>
+      ${t.articles.map(a => `<a class="link" href="${esc(a.url)}" target="_blank" rel="noopener">↗ ${esc(a.title)}</a>`).join("")}</div>
+
+    <div class="card"><h3>${done ? "Reply sent" : "Suggested reply"}</h3>
+      ${done ? `<div class="msg">${esc(t.sent_reply || "Resolved without a reply.")}</div>` : `
+        ${t.subject ? `<div class="small" style="margin-bottom:6px"><b>Subject:</b> ${esc(t.subject)}</div>` : ""}
+        <textarea id="reply" aria-label="Reply to the customer">${esc(t.reply)}</textarea>
+        <div class="muted small">${t.reply_prepared ? `Prepared by Cirrus from the help articles above, with the sources listed for the customer. Check it and change anything that isn't right.`
+          : `Cirrus could not prepare a reply for this one. Write it here.`} Before sending, the reply is checked for personal data and passwords or keys.</div>
+        <div class="actions"><span id="msg" class="small" style="flex:1;align-self:center"></span>
+          <button id="save">Save reply</button><button class="outline" id="resolve">Mark resolved</button>
+          <button class="primary" id="send">Send reply</button></div>`}</div>
+
+    <div class="card"><details><summary>Decision trail</summary><div class="trail">
+      ${t.trail.map(d => `<div><span class="muted">${esc(d.at)}</span><b>${esc(d.step)}</b><span>${esc(d.decision)}</span><span class="small">${esc(d.why)}</span></div>`).join("")}
+      </div></details></div>`;
+  if (done) return;
+  const say = (html) => { $("msg").innerHTML = html; };
+  const item = tickets.find(x => x.ticket_id === id);
+  if (item) $("status").value = item.work_status === "In progress" ? "in_progress" : "open";
+  $("status").onchange = async () => { await post(`/staff/tickets/${encodeURIComponent(id)}/status`, {status: $("status").value}); loadList(); };
+  $("save").onclick = async () => { await post(`/staff/tickets/${encodeURIComponent(id)}/save`, {text: $("reply").value});
+    say(`<span class="ok">Saved.</span>`); loadList(); };
+  $("send").onclick = async () => {
+    try { const r = await post(`/staff/tickets/${encodeURIComponent(id)}/send`, {text: $("reply").value});
+      say(`<span class="ok">Sent to the customer.</span>` + (r.flagged.length ? ` <span class="bad">Please double-check: ${esc(r.flagged.join("; "))}</span>` : ""));
+      await loadList(); open(id);
+    } catch (e) { say(`<span class="bad">Not sent: ${esc(e.message.replace(/^not sent: /, ""))}</span>`); }
+  };
+  $("resolve").onclick = async () => {
+    if (!confirm("Mark this ticket resolved without sending a reply?")) return;
+    await post(`/staff/tickets/${encodeURIComponent(id)}/resolve`, {note: "resolved by the agent"}); await loadList(); open(id);
+  };
+}
+
+$("search").oninput = showList; $("f-status").onchange = showList; $("f-channel").onchange = showList;
+(async () => { await header("Agent"); await loadList(); if (tickets[0]) open(tickets[0].ticket_id); })();
+</script>
+</body>
+</html>

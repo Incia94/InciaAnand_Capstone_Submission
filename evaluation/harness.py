@@ -19,6 +19,7 @@ What it writes, in <output>/<run_id>/:
     metrics.md       the same figures as a readable report, with the Brief's targets beside them
     outcomes.jsonl   one line per ticket: outcome, reason, intent, sources, guardrail result
     decisions.db     the decision log for this run (SQLite; the same schema as storage/decisions.db)
+    decisions.jsonl  the same decisions in the governance record format, one per line
 
 Preparation (skip with --no-prepare): before the run, anything missing is built from the
 DEVELOPMENT data (TRAIN_DATA), never from the input file: the documentation index, the retrieval
@@ -48,7 +49,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
-from src.query_scope import CONVERSATIONAL       # fixed replies, no ticket (src/scope.py)
+from src.scope import CONVERSATIONAL       # fixed replies, no ticket (src/scope.py)
 
 log = logging.getLogger("harness")
 
@@ -127,7 +128,10 @@ def ticket_row(state: dict, corpus: Any) -> dict:
     cited = [cid for cl in (a.claims if a else []) for cid in cl.citations]
     return {
         # A fixed reply (small talk, a clarifying question...) is neither an answer nor an escalation.
-        "ticket_id": t.ticket_id, "outcome": "conversation" if o.decided_by in CONVERSATIONAL else o.outcome,
+        # A reply held for review (REPLY_MODE=review) is the system's answer, so it is scored as sent.
+        "ticket_id": t.ticket_id, "outcome": ("conversation" if o.decided_by in CONVERSATIONAL else
+                                              "sent" if o.outcome == "pending_review" else o.outcome),
+        "held_for_review": o.outcome == "pending_review",
         "decided_by": o.decided_by, "reason": o.reason,
         "channel": t.channel.value, "customer_tier": t.customer_tier.value,
         "customer_region": t.customer_region.value, "language_fluency": t.language_fluency.value,
@@ -158,6 +162,7 @@ def ticket_row(state: dict, corpus: Any) -> dict:
         "draft_sources": [s_["doc_id"] for s_ in (o.draft_reply or {}).get("sources", [])],
         "language": t.language, "translated": t.translated, "reply_language": a.reply_language if a else None,
         "intent_hint_used": bool(r and r.hinted),
+        "tier": o.tier, "tier_reason": o.tier_reason,
     }
 
 
@@ -201,8 +206,10 @@ def compute_metrics(rows: list[dict], reconcile: dict) -> dict:
     # says a person is needed, and "avoidable" (a findability problem) when the label says it could
     # have been answered automatically from the documentation.
     esc_lab = [r for r in esc if r["labels"]]
+    # A channel-policy escalation (an email reply held for an agent to check, say) is a deliberate
+    # choice, not a findability failure, so it is counted on its own.
     avoidable = [r for r in esc_lab if r["labels"].get("expected_route") == "auto_respond"
-                 and r["labels"].get("expected_doc_ids")]
+                 and r["labels"].get("expected_doc_ids") and r["decided_by"] != "channel_policy"]
     escalations = {
         "by_category": dict(Counter(r["escalation_category"] or r["decided_by"] for r in esc).most_common()),
         "by_team": dict(Counter(r["suggested_team"] or "unknown" for r in esc).most_common()),
@@ -232,6 +239,12 @@ def compute_metrics(rows: list[dict], reconcile: dict) -> dict:
         "errors": sum(bool(r["error"]) for r in rows),
         "unprocessable_input": sum(not r["processable"] for r in rows),
         "conversational_replies": sum(r["decided_by"] in CONVERSATIONAL for r in rows),
+        "by_tier": {f"tier_{k}": sum(r["tier"] == k for r in rows) for k in range(4)},
+        "held_by_channel_policy": sum(r["decided_by"] == "channel_policy" for r in rows),
+        "by_channel_outcome": {ch: dict(Counter(r["outcome"] for r in rows if r["channel"] == ch))
+                               for ch in sorted({r["channel"] for r in rows})},
+        "model_calls_avoided": sum(r["tier"] in (0, 1) for r in rows),
+        "answers_held_for_review": sum(bool(r.get("held_for_review")) for r in rows),
         "tickets_with_labels": len(lab),
     }
 
@@ -557,6 +570,9 @@ def run_harness(input_path: Path, output_dir: Path, *, pipeline: Any = None, pre
     if judge:
         judge_rows(rows, records, truth_path, say, corpus=corpus)
     reconcile = store.reconcile(run_id, ids)
+    with (out / "decisions.jsonl").open("w", encoding="utf-8") as fh:      # the governance record format
+        for rec in store.export(run_id=run_id):
+            fh.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
     metrics = compute_metrics(rows, reconcile)
     if judge:
         judged = [r["judge"] for r in rows if r.get("judge", {}).get("judged")]

@@ -66,6 +66,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -88,7 +89,11 @@ DEFAULT_K = 5
 # Used only until `calibrate` has run (and written storage/retrieval.json).
 FALLBACK_THRESHOLDS = {"dense": 0.45, "lexical": 0.20, "hybrid": 0.38}
 HINT_FACTOR = 0.6                 # hint threshold = 0.6 x threshold until calibrate has run
+APPROVED_PRECISION = 0.95         # Tier 1: the score above which the top article is right this often
+APPROVED_MIN_TICKETS = 20
+APPROVED_MARGIN = 0.10            # until calibrate has run: threshold + 0.10
 DEFAULT_HYBRID_WEIGHT = 0.7
+DEFAULT_BM25_WEIGHT = 0.3       # share of BM25 in the keyword leg (LEXICAL_BM25_WEIGHT)
 
 
 # ------------------------------------------------------------------ output
@@ -160,9 +165,13 @@ Hits = list[tuple[str, float]]  # (chunk_id, score), best first
 
 
 class LexicalSearch:
+    """The keyword leg: TF-IDF over words and character n-grams, blended with BM25 (LEXICAL_BM25_WEIGHT,
+    default 0.3). TF-IDF's character n-grams tolerate misspellings ("deploymnet"); BM25 rewards exact
+    terms and error codes ("429", "ERR_QUOTA") that appear in few articles. Chosen on the development
+    tickets (cross-fitted Youden J 0.512 blended, 0.500 TF-IDF alone, 0.447 BM25 alone)."""
     name = "lexical"
 
-    def __init__(self, corpus: Corpus):
+    def __init__(self, corpus: Corpus, bm25_weight: Optional[float] = None):
         from sklearn.feature_extraction.text import TfidfVectorizer
         from sklearn.pipeline import make_union
         self.ids = [c.chunk_id for c in corpus.chunks]
@@ -170,13 +179,83 @@ class LexicalSearch:
             TfidfVectorizer(ngram_range=(1, 2), sublinear_tf=True, stop_words="english"),
             TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), sublinear_tf=True))
         self.matrix = self.vectoriser.fit_transform([c.text for c in corpus.chunks])
+        self.bm25_weight = float(os.getenv("LEXICAL_BM25_WEIGHT", DEFAULT_BM25_WEIGHT)
+                                 if bm25_weight is None else bm25_weight)
+        self.bm25 = BM25Search(corpus) if self.bm25_weight > 0 else None
 
     def search(self, text: str, k: int) -> Hits:
         from sklearn.metrics.pairwise import cosine_similarity
         q = self.vectoriser.transform([text])
-        if q.nnz == 0:
+        scores = cosine_similarity(q, self.matrix)[0] if q.nnz else np.zeros(len(self.ids))
+        if self.bm25 is not None:
+            raw, ceiling = self.bm25.raw_scores(text)
+            bm = raw / ceiling if ceiling > 0 else np.zeros(len(self.ids))
+            scores = (1 - self.bm25_weight) * scores + self.bm25_weight * bm
+        if not scores.any():
             return []
-        scores = cosine_similarity(q, self.matrix)[0] / 1.0   # union of two l2-normed parts -> 0..1
+        order = np.argsort(-scores, kind="stable")[:k]
+        return [(self.ids[i], float(scores[i])) for i in order]
+
+
+_TOKEN = re.compile(r"[a-z0-9]+(?:[._-][a-z0-9]+)*")
+_BM25_STOP = frozenset("""a an the and or but if then so to of in on at by for with from about as is are was were be
+been being do does did have has had i me my we our us you your it its they them their this that these those
+what which who when where why how can could will would should may might must not no yes please""".split())
+
+
+def bm25_tokens(text: str) -> list[str]:
+    """Lower-case words and codes. Error codes and identifiers stay whole ("429", "err_quota_exceeded",
+    "x-api-key", "v2.1"), and each part of a joined identifier is indexed too, so "quota" finds it."""
+    out = []
+    for tok in _TOKEN.findall((text or "").lower()):
+        if tok in _BM25_STOP:
+            continue
+        out.append(tok)
+        parts = re.split(r"[._-]", tok)
+        if len(parts) > 1:
+            out.extend(p for p in parts if p and p not in _BM25_STOP)
+    return out
+
+
+class BM25Search:
+    """Okapi BM25 (k1=1.5, b=0.75) over the articles: exact keyword and error-code matching.
+
+    BM25 scores have no fixed scale, which a relevance threshold needs. Each score is divided by the
+    most a passage could score for that query (every query term present, saturated, in a passage of
+    average length), so 1.0 means "contains every query term, many times" and scores compare across
+    queries. No model and no network: this is also the fallback when dense search fails (A11)."""
+    name = "lexical"
+    method = "bm25"
+
+    def __init__(self, corpus: Corpus, k1: float = 1.5, b: float = 0.75):
+        from collections import Counter
+        self.ids = [c.chunk_id for c in corpus.chunks]
+        self.k1, self.b = k1, b
+        docs = [bm25_tokens(c.text) for c in corpus.chunks]
+        self.tf = [Counter(d) for d in docs]
+        self.len = np.array([len(d) for d in docs], dtype=float)
+        self.avg = float(self.len.mean()) if len(docs) else 1.0
+        n = len(docs)
+        df = Counter(t for d in docs for t in set(d))
+        self.idf = {t: float(np.log(1 + (n - f + 0.5) / (f + 0.5))) for t, f in df.items()}
+
+    def raw_scores(self, text: str) -> tuple[np.ndarray, float]:
+        terms = [t for t in dict.fromkeys(bm25_tokens(text)) if t in self.idf]
+        scores = np.zeros(len(self.ids))
+        if not terms:
+            return scores, 0.0
+        norm = self.k1 * (1 - self.b + self.b * self.len / self.avg)
+        for t in terms:
+            f = np.array([tf.get(t, 0) for tf in self.tf], dtype=float)
+            scores += self.idf[t] * f * (self.k1 + 1) / (f + norm)
+        ceiling = sum(self.idf[t] for t in terms) * (self.k1 + 1)
+        return scores, ceiling
+
+    def search(self, text: str, k: int) -> Hits:
+        raw, ceiling = self.raw_scores(text)
+        if ceiling <= 0:
+            return []
+        scores = raw / ceiling
         order = np.argsort(-scores, kind="stable")[:k]
         return [(self.ids[i], float(scores[i])) for i in order]
 
@@ -243,16 +322,24 @@ class Retriever:
         self.primary_error = primary_error
 
     def retrieve(self, ticket: Any, k: Optional[int] = None,
-                 hint_docs: Optional[Sequence[str]] = None) -> RetrievalResult:
+                 hint_docs: Optional[Sequence[str]] = None, filters: Optional[dict] = None) -> RetrievalResult:
         """Never raises. Returns passages above the threshold, best first, or none. With hint_docs
         (the articles the ticket's intent has needed before), a near miss from one of those
-        articles is returned when it clears the lower hint threshold (see module notes)."""
+        articles is returned when it clears the lower hint threshold (see module notes). With
+        filters ({"category": ..., "product": ..., "doc_version": ...}, each a value or a list),
+        only matching articles are considered (see matches_filters)."""
         started = time.perf_counter()
         k = k or self.k
         ticket_id, text = _query_of(ticket)
-        result = self._retrieve(ticket_id, text, k, set(hint_docs or ()))
+        result = self._retrieve(ticket_id, text, k, set(hint_docs or ()), filters or None)
         result.latency_ms = round((time.perf_counter() - started) * 1000, 2)
         return result
+
+    def approved_threshold(self, backend: str) -> float:
+        """Tier 1 (approved content, no model): a match this strong is right often enough that the
+        article's own resolution steps are sent as the answer (see approved_threshold_from)."""
+        base = self.thresholds.get(backend, FALLBACK_THRESHOLDS.get(backend, 0.3))
+        return float(self.thresholds.get(f"{backend}_approved", base + APPROVED_MARGIN))
 
     def hint_threshold(self, backend: str) -> float:
         key = f"{backend}_hint"
@@ -268,7 +355,17 @@ class Retriever:
                                    section=c.section, score=round(score, 4), text=c.text, via=via))
         return out
 
-    def _retrieve(self, ticket_id: str, text: str, k: int, hint_docs: Optional[set] = None) -> RetrievalResult:
+    def facets(self) -> dict[str, list[str]]:
+        """The values each metadata filter can take, from the indexed articles."""
+        out: dict[str, set] = {"category": set(), "product": set(), "doc_version": set()}
+        for c in self.corpus.chunks:
+            out["category"].add(c.metadata.get("category", ""))
+            out["doc_version"].add(c.metadata.get("doc_version", "1.0"))
+            out["product"].update(p for p in str(c.metadata.get("product", "")).split(",") if p)
+        return {k: sorted(v - {""}) for k, v in out.items()}
+
+    def _retrieve(self, ticket_id: str, text: str, k: int, hint_docs: Optional[set] = None,
+                  filters: Optional[dict] = None) -> RetrievalResult:
         if not text.strip():
             return RetrievalResult(ticket_id=ticket_id, status="empty_query", reason="ticket has no usable text")
         backend, degraded, reason = self.primary, False, ""
@@ -276,13 +373,14 @@ class Retriever:
             backend, degraded = self.fallback, True
             reason = self.primary_error or "no dense index configured; lexical search used"
         hits: Hits = []
+        wide = bool(hint_docs or filters)                   # filtering needs every article scored first
         try:
-            hits = backend.search(text, len(self.corpus.chunks) if hint_docs else max(k, DEFAULT_K))
+            hits = backend.search(text, len(self.corpus.chunks) if wide else max(k, DEFAULT_K))
         except Exception as exc:
             log.warning("%s search failed (%s); using lexical fallback", backend.name, exc)
             backend, degraded, reason = self.fallback, True, f"{backend.name} failed: {type(exc).__name__}: {exc}"
             try:
-                hits = backend.search(text, len(self.corpus.chunks) if hint_docs else max(k, DEFAULT_K))
+                hits = backend.search(text, len(self.corpus.chunks) if wide else max(k, DEFAULT_K))
             except Exception as exc2:  # nothing left to try
                 return RetrievalResult(ticket_id=ticket_id, status="unavailable", degraded=True,
                                        reason=f"{reason}; lexical failed: {exc2}")
@@ -290,6 +388,10 @@ class Retriever:
         verified = [(cid, s) for cid, s in hits if self.corpus.resolve(cid) is not None]
         if len(verified) < len(hits):
             reason = (reason + "; " if reason else "") + f"{len(hits) - len(verified)} unresolvable id(s) dropped"
+        if filters:
+            verified = [(cid, s) for cid, s in verified if matches_filters(self.corpus.resolve(cid).metadata, filters)]
+            reason = (reason + "; " if reason else "") + "filtered by " + ", ".join(
+                f"{key}={val}" for key, val in filters.items())
         threshold = float(self.thresholds.get(backend.name, FALLBACK_THRESHOLDS[backend.name]))
         top = verified[0][1] if verified else 0.0
         passages = []
@@ -323,6 +425,52 @@ class Retriever:
                         for c, s in verified[:max(k, DEFAULT_K)]],
             top_score=round(top, 4), threshold=round(threshold, 4), backend=backend.name,
             degraded=degraded, hinted=hinted, reason=reason)
+
+
+def cited_results(retriever: "Retriever", query: str, filters: Optional[dict] = None, k: int = DEFAULT_K,
+                  store: Any = None) -> dict:
+    """Documentation search for a person (an agent, or the API's /search): the matching passages,
+    each numbered and citable as [n] with its article title and id. A search that finds nothing
+    says so (no near misses dressed up as answers) and, given a decision log, is recorded as a
+    knowledge gap (src/gaps.py)."""
+    r = retriever.retrieve({"ticket_id": "SEARCH", "body": query}, k=k, filters=filters)
+    results = []
+    for n, p in enumerate(r.passages, 1):
+        meta = retriever.corpus.resolve(p.chunk_id).metadata
+        results.append({"citation": f"[{n}]", "doc_id": p.doc_id, "title": p.title, "chunk_id": p.chunk_id,
+                        "score": p.score, "category": meta.get("category"), "product": meta.get("product"),
+                        "doc_version": meta.get("doc_version"), "excerpt": _excerpt_of(p.text),
+                        "via": p.via})
+    if not results and store is not None and query.strip():
+        from src.gaps import record_search_gap
+        record_search_gap(store, query, "documentation search", topic_hint=", ".join(
+            (filters or {}).get("category") or []) or None)
+    return {"query": query, "filters": filters or {}, "backend": r.backend, "degraded": r.degraded,
+            "threshold": r.threshold, "status": r.status, "results": results,
+            "sources": [f"{x['citation']} {x['title']} ({x['doc_id']})" for x in results],
+            "closest_below_threshold": [] if results else [
+                {"doc_id": c.chunk_id.split("::")[0], "title": c.title, "score": c.score} for c in r.candidates[:3]],
+            "note": "" if results else "No article is relevant enough to cite."}
+
+
+def matches_filters(meta: dict, filters: dict) -> bool:
+    """Metadata filtering. category and doc_version must match one of the values given. product
+    matches an article written for that product, or one that applies to every product."""
+    def wanted(key):
+        v = filters.get(key)
+        if v in (None, "", [], ()):
+            return None
+        return {str(x).lower() for x in (v if isinstance(v, (list, tuple, set)) else [v])}
+    cat, ver, prod = wanted("category"), wanted("doc_version"), wanted("product")
+    if cat and str(meta.get("category", "")).lower() not in cat:
+        return False
+    if ver and str(meta.get("doc_version", "1.0")).lower() not in ver:
+        return False
+    if prod:
+        have = {p.strip().lower() for p in str(meta.get("product", "")).split(",") if p.strip()}
+        if not (have & prod or "all products" in have):
+            return False
+    return True
 
 
 def _excerpt_of(text: str, limit: int = 400) -> str:
@@ -421,6 +569,20 @@ def hint_rows(search: Any, corpus: Corpus, tickets: Sequence[NormalisedTicket],
 
 def _fit_rows(rows: Sequence[dict]) -> list[dict]:
     return [r for r in rows if r["group"] != "ambiguous"]
+
+
+def approved_threshold_from(rows: Sequence[dict], floor: float) -> float:
+    """The lowest top score at or above which the top article is the right one for at least
+    APPROVED_PRECISION of labelled tickets (and at least APPROVED_MIN_TICKETS of them). Never below
+    the relevance threshold."""
+    usable = sorted((r for r in rows if r["group"] in ("relevant", "wrong", "no_doc")),
+                    key=lambda r: -r["top_score"])
+    best, right = None, 0
+    for n, r in enumerate(usable, 1):
+        right += bool(r["top_correct"])
+        if n >= APPROVED_MIN_TICKETS and right / n >= APPROVED_PRECISION:
+            best = r["top_score"]
+    return max(floor, best) if best is not None else floor + APPROVED_MARGIN
 
 
 def best_threshold(rows: Sequence[dict]) -> float:
@@ -579,6 +741,7 @@ def calibrate(retriever: Retriever, tickets: Sequence[NormalisedTicket], config_
         out.setdefault("ambiguous_excluded", sum(r["group"] == "ambiguous" for r in rows))
         out["thresholds"][b.name] = round(th, 4)
         out["metrics"][b.name] = {**metrics(rows, th), **cross_fitted_metrics(rows)}
+        out["thresholds"][f"{b.name}_approved"] = round(approved_threshold_from(rows, th), 4)
         # intent-guided threshold: only the near misses matter, so fit it on tickets below th
         hrows = [r for r in hint_rows(b, retriever.corpus, tickets, intent_docs) if r["top_score"] < th]
         hth = best_threshold(hrows) if hrows else HINT_FACTOR * th
@@ -612,9 +775,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--backend", choices=["hybrid", "dense", "lexical"],
                    default=os.getenv("RETRIEVAL_BACKEND", "hybrid"))
     sub = p.add_subparsers(dest="command", required=True)
-    s = sub.add_parser("search", help="search for one query")
+    s = sub.add_parser("search", help="search for one query; results come with numbered citations")
     s.add_argument("query")
     s.add_argument("-k", type=int, default=DEFAULT_K)
+    s.add_argument("--category", action="append", help="only this category (repeatable)")
+    s.add_argument("--product", action="append", help="only articles for this product (repeatable)")
+    s.add_argument("--doc-version", action="append", help="only this documentation version (repeatable)")
+    s.add_argument("--json", action="store_true", help="print the full result as JSON")
     c = sub.add_parser("calibrate", help="set thresholds from labelled tickets")
     c.add_argument("--tickets", type=Path, default=Path(os.getenv("TRAIN_DATA", DEFAULT_TRAIN)))
     e = sub.add_parser("evaluate", help="hit rate and threshold behaviour on labelled tickets")
@@ -645,7 +812,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 0
         retriever = build_retriever(args.docs, config_path=args.config, backend=args.backend)
         if args.command == "search":
-            print(retriever.retrieve(args.query, k=args.k).model_dump_json(indent=2))
+            filters = {k: v for k, v in (("category", args.category), ("product", args.product),
+                                         ("doc_version", args.doc_version)) if v}
+            res = cited_results(retriever, args.query, filters=filters or None, k=args.k)
+            if args.json:
+                print(json.dumps(res, indent=2))
+            else:
+                print(f"Search ({res['backend']}{', backup mode' if res['degraded'] else ''}): {args.query}")
+                for x in res["results"]:
+                    print(f"\n{x['citation']} {x['title']} ({x['doc_id']}) · score {x['score']:.2f} · "
+                          f"{x['category']} · {x['product']} · v{x['doc_version']}\n    {x['excerpt']}")
+                if not res["results"]:
+                    print(res["note"] + "".join(f"\n  closest: {c['title']} ({c['doc_id']}, {c['score']:.2f})"
+                                                for c in res["closest_below_threshold"]))
+                else:
+                    print("\nSources:\n" + "\n".join(res["sources"]))
         elif args.command == "calibrate":
             print(json.dumps(calibrate(retriever, _labelled(load_tickets(args.tickets)), args.config), indent=2))
         else:

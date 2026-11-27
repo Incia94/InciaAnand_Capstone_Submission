@@ -808,6 +808,7 @@ def create_app(pipeline: Optional[SupportPipeline] = None) -> FastAPI:
         if getattr(request.app.state, "staff", None) is None:
             from src.staff import StaffDirectory
             request.app.state.staff = StaffDirectory()
+            request.app.state.staff.ensure_demo()
         return request.app.state.staff
 
     def signed_in(request: Request, role: Optional[str] = None) -> dict:
@@ -858,7 +859,7 @@ def create_app(pipeline: Optional[SupportPipeline] = None) -> FastAPI:
         body = await request.json() if (await request.body()) else {}
         signed = staff_of(request).sign_in(body.get("email", ""), body.get("password", ""))
         if signed is None:
-            return JSONResponse(status_code=401, content={"detail": "Wrong email or password."})
+            return JSONResponse(status_code=401, content={"detail": "Wrong username or password."})
         token, user = signed
         r = JSONResponse({"user": user, "home": f"/{user['role']}"})
         r.set_cookie(COOKIE, token, httponly=True, samesite="lax", max_age=SESSION_HOURS * 3600,

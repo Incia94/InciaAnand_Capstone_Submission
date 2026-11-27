@@ -19,3 +19,5 @@ def _reply_mode(monkeypatch, tmp_path_factory, request):
         monkeypatch.delenv("REPLY_MODE", raising=False)
     if "REVIEW_DB" not in __import__("os").environ:
         monkeypatch.setenv("REVIEW_DB", str(tmp_path_factory.getbasetemp() / "reviews.db"))
+    if "STAFF_FILE" not in __import__("os").environ:
+        monkeypatch.setenv("STAFF_FILE", str(tmp_path_factory.getbasetemp() / "staff.json"))

@@ -95,7 +95,7 @@ def test_sign_in_page_and_wrong_password(app):
     c = TestClient(app)
     assert "Staff sign-in" in c.get("/").text
     r = c.post("/staff/login", json={"email": "asha@cloudserve.example", "password": "nope-nope"})
-    assert r.status_code == 401 and r.json()["detail"] == "Wrong email or password."
+    assert r.status_code == 401 and r.json()["detail"] == "Wrong username or password."
     assert c.get("/staff/me").status_code == 401
 
 

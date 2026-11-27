@@ -224,7 +224,6 @@ def test_customer_history_spans_channels(hub):
 def test_hub_data_api(hub):
     with TestClient(A.create_app(hub.pipeline)) as client:
         client.app.state.hub = hub
-        assert client.get("/dashboard", follow_redirects=False).headers["location"] == "/"
         results = client.post("/hub/simulate?count=8").json()["results"]
         assert {r["channel"] for r in results} == set(CHANNELS)
         summary = client.get("/hub/summary").json()

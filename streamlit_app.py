@@ -243,14 +243,17 @@ def ticket(tid: str):
                             label_visibility="collapsed")
         b = st.columns([1, 1, 1, 2])
         if b[0].button("Save reply", key=f"save_{tid}", width="stretch"):
-            hub.save_reply(tid, text)
+            try:
+                hub.save_reply(tid, text, user)
+            except (LookupError, PermissionError) as exc:
+                st.error(str(exc))
             st.toast("Reply saved.")
         if b[1].button("Mark resolved", key=f"resolve_{tid}", width="stretch",
                        help="Close the ticket without sending a reply (for example, solved on a call)"):
             try:
                 hub.resolve_without_reply(tid, user, "")
                 st.rerun()
-            except ReviewError as exc:
+            except (ReviewError, LookupError, PermissionError) as exc:
                 st.error(str(exc))
         if b[2].button("Send reply", key=f"send_{tid}", type="primary", width="stretch",
                        disabled=not v["can_send"]):
@@ -262,7 +265,7 @@ def ticket(tid: str):
                     st.session_state.pop(f"reply_{tid}", None)
                     st.toast("Reply sent" + (" (with your edits)." if res["edited"] else "."))
                     st.rerun()
-                except ReviewError as exc:
+                except (ReviewError, LookupError, PermissionError) as exc:
                     st.error(f"Not sent: {exc}")
         if not v["can_send"]:
             b[3].caption("Sending is off for this ticket; you can still save a reply or mark it resolved.")

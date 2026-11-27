@@ -1,8 +1,8 @@
 """Staff accounts and sign-in for the support workspace: supervisors and agents.
 
 Accounts live in STAFF_FILE (default storage/staff.json, which git ignores). Only a salted
-PBKDF2-SHA256 hash of each password is kept. Sessions are random tokens held in memory (a restart
-signs everyone out) and sent as an HttpOnly, SameSite=Lax cookie.
+PBKDF2-SHA256 hash of each password is kept. The workspace (streamlit_app.py) checks the password
+with `check` and keeps the signed-in person in that browser session.
 
 Staff sign in with their username (the part of the email before @, or their first name; "admin" is
 the supervisor) or their full email.
@@ -32,14 +32,11 @@ import os
 import secrets
 import sys
 import threading
-import time
 from pathlib import Path
 from typing import Optional, Sequence
 
 ROLES = ("supervisor", "agent")
 ITERATIONS = 200_000
-SESSION_HOURS = 12
-COOKIE = "cirrus_session"
 DEMO_STAFF = [
     ("marcus@cloudserve.example", "Marcus Adeyemi", "Support Operations", "supervisor"),
     ("asha@cloudserve.example", "Asha", "API Support", "agent"),
@@ -56,7 +53,6 @@ class StaffDirectory:
     def __init__(self, path: Optional[Path] = None):
         self.path = Path(path or os.getenv("STAFF_FILE", "./storage/staff.json"))
         self._lock = threading.Lock()
-        self._sessions: dict[str, tuple[str, float]] = {}
 
     # ---------------- accounts
     def _load(self) -> dict:
@@ -135,30 +131,6 @@ class StaffDirectory:
             return None
         ok = hmac.compare_digest(_hash(password or "", bytes.fromhex(u["salt"])), u["hash"])
         return self.get(u["email"]) if ok else None
-
-    # ---------------- sessions
-    def sign_in(self, email: str, password: str) -> Optional[tuple[str, dict]]:
-        user = self.check(email, password)
-        if user is None:
-            return None
-        token = secrets.token_urlsafe(32)
-        with self._lock:
-            self._sessions[token] = (user["email"], time.time() + SESSION_HOURS * 3600)
-        return token, user
-
-    def user_for(self, token: Optional[str]) -> Optional[dict]:
-        if not token:
-            return None
-        with self._lock:
-            entry = self._sessions.get(token)
-            if entry is None or entry[1] < time.time():
-                self._sessions.pop(token, None)
-                return None
-        return self.get(entry[0])
-
-    def sign_out(self, token: Optional[str]) -> None:
-        with self._lock:
-            self._sessions.pop(token or "", None)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

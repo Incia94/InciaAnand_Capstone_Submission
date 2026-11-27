@@ -1,15 +1,16 @@
-"""The support workspace: staff sign-in, the supervisor's queue and reports, the agent's tickets.
+"""The support workspace's rules and views (src/hub.py, src/workspace.py, src/staff.py).
 
-A supervisor sees every ticket from every channel and assigns it; an agent sees only their own
-tickets, checks Cirrus's cited reply and sends it. Everything is logged, and nothing on screen uses
-the pipeline's technical vocabulary."""
+The screens are the Streamlit app (tests/test_streamlit_app.py drives it). These tests check the rules
+underneath, which hold whatever screen calls them: a supervisor sees every ticket and assigns it; an
+agent acts only on their own tickets, checks Cirrus's cited reply and sends it; everything is logged;
+and nothing shown to staff uses the pipeline's technical vocabulary."""
 import json
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
 
 from src import api as A
+from src import workspace as W
 from src.classify import Classifier
 from src.generate import Generator
 from src.guardrail import Guardrails
@@ -17,13 +18,12 @@ from src.hub import SupportHub
 from src.ingest import load_tickets
 from src.logging_store import DecisionStore
 from src.retrieve import Corpus, Retriever, _labelled, approved_threshold_from, best_threshold, score_tickets
+from src.review import ReviewError
 from src.route import Router, RoutingConfig, _label_sets
-from src.staff import COOKIE, StaffDirectory
-from src.workspace import plain
+from src.staff import StaffDirectory
 from tests import fakes
 
 DATA = Path(__file__).resolve().parents[1] / "data"
-WEB = Path(__file__).resolve().parents[1] / "src" / "web"
 PASSWORD = fakes.password()                      # made up per test run: no password is written in the code
 WRONG = fakes.password()
 ROLLBACK = ("How do I revert to an earlier revision? The release we put out this morning is causing errors and I "
@@ -47,32 +47,23 @@ def parts():
 
 
 @pytest.fixture
-def app(tmp_path, parts, monkeypatch):
+def ws(tmp_path, parts, monkeypatch):
+    """A hub in review mode (agents send every reply) and three staff accounts."""
     monkeypatch.setenv("KILL_SWITCH_FILE", str(tmp_path / "KS"))
     monkeypatch.delenv("KILL_SWITCH", raising=False)
-    monkeypatch.delenv("REPLY_MODE", raising=False)                 # review mode: agents send every reply
+    monkeypatch.delenv("REPLY_MODE", raising=False)
     monkeypatch.setenv("REVIEW_DB", str(tmp_path / "reviews.db"))
     monkeypatch.setenv("TICKETS_DB", str(tmp_path / "tickets.db"))
     staff = StaffDirectory(tmp_path / "staff.json")
-    staff.add("boss@cloudserve.example", "Marcus", "Support Operations", "supervisor", PASSWORD)
-    staff.add("asha@cloudserve.example", "Asha", "API Support", "agent", PASSWORD)
-    staff.add("ravi@cloudserve.example", "Ravi", "Deployments", "agent", PASSWORD)
+    boss = staff.add("boss@cloudserve.example", "Marcus", "Support Operations", "supervisor", PASSWORD)
+    asha = staff.add("asha@cloudserve.example", "Asha", "API Support", "agent", PASSWORD)
+    ravi = staff.add("ravi@cloudserve.example", "Ravi", "Deployments", "agent", PASSWORD)
     classifier, retriever, router, corpus = parts
     p = A.SupportPipeline(classifier, retriever, router, Generator(None, unavailable_reason="no key"),
                           Guardrails(corpus=corpus), DecisionStore(f"sqlite:///{tmp_path / 'decisions.db'}"),
                           A.Metrics())
-    application = A.create_app(p)
-    application.state.staff = staff
-    application.state.hub = SupportHub(p)
-    yield application
+    yield SupportHub(p), staff, boss, asha, ravi
     p.store.close()
-
-
-def client_as(app, email):
-    c = TestClient(app)
-    r = c.post("/staff/login", json={"email": email, "password": PASSWORD})
-    assert r.status_code == 200, r.text
-    return c
 
 
 def chat(text, session):
@@ -80,153 +71,127 @@ def chat(text, session):
             "messages": [{"from": "visitor", "text": text}]}
 
 
-# ================================================================= accounts and sign-in
+def assigned(hub, boss, agent, text=ROLLBACK, session="s1"):
+    tid = hub.receive("chat", chat(text, session))["ticket_id"]
+    hub.assign(tid, agent, boss)
+    return tid
+
+
+# ================================================================= accounts
 def test_passwords_are_stored_only_as_salted_hashes(tmp_path):
     s = StaffDirectory(tmp_path / "staff.json")
     s.add("a@cloudserve.example", "A", "T", "agent", PASSWORD)
     raw = (tmp_path / "staff.json").read_text()
     assert PASSWORD not in raw and json.loads(raw)["a@cloudserve.example"]["hash"]
     assert s.check("a@cloudserve.example", PASSWORD)["role"] == "agent"
+    assert s.check("a", PASSWORD)["role"] == "agent"                       # username = the part before @
     assert s.check("a@cloudserve.example", WRONG) is None
     with pytest.raises(ValueError):
         s.add("b@cloudserve.example", "B", "T", "agent", "short")
 
 
-def test_sign_in_page_and_wrong_password(app):
-    c = TestClient(app)
-    assert "Staff sign-in" in c.get("/").text
-    r = c.post("/staff/login", json={"email": "asha@cloudserve.example", "password": WRONG})
-    assert r.status_code == 401 and r.json()["detail"] == "Wrong username or password."
-    assert c.get("/staff/me").status_code == 401
-
-
-def test_each_role_lands_on_its_own_screen_and_cannot_open_the_other(app):
-    sup = client_as(app, "boss@cloudserve.example")
-    assert sup.get("/", follow_redirects=False).headers["location"] == "/supervisor"
-    assert "Ticket queue" in sup.get("/supervisor").text
-    agent = client_as(app, "asha@cloudserve.example")
-    assert agent.get("/", follow_redirects=False).headers["location"] == "/agent"
-    assert "My tickets" in agent.get("/agent").text
-    assert agent.get("/supervisor", follow_redirects=False).headers["location"] == "/"
-    assert agent.get("/staff/queue").status_code == 403 and agent.get("/staff/reports").status_code == 403
-    assert TestClient(app).get("/agent", follow_redirects=False).headers["location"] == "/"
-    cookie = agent.cookies.get(COOKIE)
-    assert cookie and agent.post("/staff/logout").status_code == 200
-    assert agent.get("/staff/me").status_code == 401
-
-
 # ================================================================= supervisor: queue, assignment, reports
-def test_supervisor_sees_every_channel_and_assigns(app):
-    sup = client_as(app, "boss@cloudserve.example")
-    assert sup.post("/staff/sample?count=8").json()["added"] >= 8
-    queue = sup.get("/staff/queue?tab=unassigned").json()["tickets"]
+def test_supervisor_sees_every_channel_and_assigns(ws):
+    hub, staff, boss, asha, ravi = ws
+    hub.simulate(count=8)
+    queue = W.queue(hub, "unassigned")
     assert queue and {t["channel"] for t in queue} >= {"Email", "Live chat"}
     assert all(t["ticket_id"].startswith("CS-") and t["priority"] in ("High", "Medium", "Low") for t in queue)
-    agents = sup.get("/staff/agents").json()["agents"]
-    assert [a["name"] for a in agents] == ["Asha", "Ravi"]
+    assert [a["name"] for a in staff.list("agent")] == ["Asha", "Ravi"]
     tid = queue[0]["ticket_id"]
-    assert sup.post(f"/staff/tickets/{tid}/assign", json={"agent": "asha@cloudserve.example"}).status_code == 200
-    assert tid not in [t["ticket_id"] for t in sup.get("/staff/queue?tab=unassigned").json()["tickets"]]
-    assigned = sup.get("/staff/queue?tab=assigned").json()["tickets"]
-    assert assigned[0]["assignee"] == "Asha · API Support"
-    assert sup.post(f"/staff/tickets/{tid}/assign", json={"agent": "boss@cloudserve.example"}).status_code == 422
-    log = app.state.hub.pipeline.store.export(ticket_id=tid)
+    hub.assign(tid, asha, boss)
+    assert tid not in [t["ticket_id"] for t in W.queue(hub, "unassigned")]
+    assert W.queue(hub, "assigned")[0]["assignee"] == "Asha · API Support"
+    log = hub.pipeline.store.export(ticket_id=tid)
     assert log[-1]["stage"] == "assignment" and "Marcus assigned the ticket to Asha" in log[-1]["reason"]
+    with pytest.raises(LookupError):
+        hub.assign("CS-9999", asha, boss)
 
 
-def test_reports_volume_channels_and_decision_log(app):
-    sup = client_as(app, "boss@cloudserve.example")
-    sup.post("/staff/sample?count=8")
-    r = sup.get("/staff/reports").json()
+def test_reports_volume_channels_and_decision_log(ws):
+    hub = ws[0]
+    hub.simulate(count=8)
+    r = W.reports(hub)
     assert r["total"] >= 8 and len(r["volume"]) == 14 and r["volume"][-1]["tickets"] == r["total"]
     assert sum(c["tickets"] for c in r["by_channel"]) == r["total"]
     log = r["decision_log"]
     assert log["every_ticket_logged"] and log["tickets"] == r["total"] and len(log["tickets_log"]) == r["total"]
-    tid = log["tickets_log"][0]["ticket_id"]
-    steps = sup.get(f"/staff/tickets/{tid}/steps").json()["steps"]
+    steps = W.ticket_steps(hub, log["tickets_log"][0]["ticket_id"])
     assert steps[0]["step"] == "Duplicate check" and any(s["step"] == "Result" for s in steps)
     text = json.dumps(r) + json.dumps(steps)
     assert not [w for w in JARGON if w in text], [w for w in JARGON if w in text]
 
 
 # ================================================================= agent: own tickets, check, send
-def assigned_ticket(app, text=ROLLBACK, session="s1", to="asha@cloudserve.example"):
-    hub = app.state.hub
-    res = hub.receive("chat", chat(text, session))
-    hub.assign(res["ticket_id"], app.state.staff.get(to), app.state.staff.get("boss@cloudserve.example"))
-    return res["ticket_id"]
-
-
-def test_agent_sees_only_their_tickets_with_cirrus_findings_and_a_cited_reply(app):
-    mine = assigned_ticket(app)
-    other = assigned_ticket(app, "Webhook signature verification fails for every delivery.", "s2",
-                            to="ravi@cloudserve.example")
-    agent = client_as(app, "asha@cloudserve.example")
-    assert [t["ticket_id"] for t in agent.get("/staff/my-tickets").json()["tickets"]] == [mine]
-    assert agent.get(f"/staff/tickets/{other}").status_code == 403
-    t = agent.get(f"/staff/tickets/{mine}").json()
+def test_agent_sees_their_tickets_with_cirrus_findings_and_a_cited_reply(ws):
+    hub, staff, boss, asha, ravi = ws
+    mine = assigned(hub, boss, asha)
+    assigned(hub, boss, ravi, "Webhook signature verification fails for every delivery.", "s2")
+    assert [t["ticket_id"] for t in hub.tickets.assigned_to(asha["email"])] == [mine]
+    t = W.agent_view(hub, mine)
     assert t["can_send"] and "Cirrus found the answer in the help articles" in t["findings"]
     assert t["articles"][0]["doc_id"] == "DOC-DEPLOY-002" and t["articles"][0]["url"].startswith("https://")
     assert "[1]" in t["reply"] and "Rolling back a failed release" in t["reply"]          # cited, with sources
     assert not [w for w in JARGON if w in json.dumps({k: t[k] for k in ("findings", "trail", "handled")})]
 
 
-def test_agent_sends_the_checked_reply_and_it_is_logged(app):
-    tid = assigned_ticket(app)
-    agent = client_as(app, "asha@cloudserve.example")
-    reply = agent.get(f"/staff/tickets/{tid}").json()["reply"]
-    r = agent.post(f"/staff/tickets/{tid}/send", json={"text": reply})
-    assert r.status_code == 200 and r.json() == {"sent": True, "edited": False, "flagged": []}
-    t = agent.get(f"/staff/tickets/{tid}").json()
+def test_agent_sends_the_checked_reply_and_it_is_logged(ws):
+    hub, staff, boss, asha, ravi = ws
+    tid = assigned(hub, boss, asha)
+    reply = W.agent_view(hub, tid)["reply"]
+    res = hub.send(tid, asha, reply)
+    assert res["edited"] is False
+    t = W.agent_view(hub, tid)
     assert not t["can_send"] and t["sent_reply"] == reply and t["work_status"] == "Resolved"
-    review = [d for d in app.state.hub.pipeline.store.export(ticket_id=tid) if d["stage"] == "human_review"]
+    review = [d for d in hub.pipeline.store.export(ticket_id=tid) if d["stage"] == "human_review"]
     assert review[0]["action_taken"] == "sent_after_review" and review[0]["prediction"]["value"] == "Asha"
-    assert agent.post(f"/staff/tickets/{tid}/send", json={"text": reply}).status_code == 409   # not twice
+    with pytest.raises(ReviewError, match="already"):
+        hub.send(tid, asha, reply)                                                   # not twice
 
 
-def test_edited_replies_are_checked_and_saved_drafts_kept(app):
-    tid = assigned_ticket(app)
-    agent = client_as(app, "asha@cloudserve.example")
-    agent.post(f"/staff/tickets/{tid}/save", json={"text": "Draft in progress"})
-    t = agent.get(f"/staff/tickets/{tid}").json()
+def test_edited_replies_are_checked_and_saved_drafts_kept(ws):
+    hub, staff, boss, asha, ravi = ws
+    tid = assigned(hub, boss, asha)
+    hub.save_reply(tid, "Draft in progress", asha)
+    t = W.agent_view(hub, tid)
     assert t["reply"] == "Draft in progress" and t["work_status"] == "In progress"
-    leak = agent.post(f"/staff/tickets/{tid}/send", json={"text": f"Use key {fakes.api_key(24)}"})
-    assert leak.status_code == 422 and "private_data" in leak.json()["detail"]
-    ok = agent.post(f"/staff/tickets/{tid}/send", json={"text": "Roll back from the revisions page, then redeploy."})
-    assert ok.json()["edited"] is True
+    with pytest.raises(ReviewError, match="private_data"):
+        hub.send(tid, asha, f"Use key {fakes.api_key(24)}")
+    assert hub.send(tid, asha, "Roll back from the revisions page, then redeploy.")["edited"] is True
 
 
-def test_mark_resolved_without_a_reply_and_status_changes(app):
-    tid = assigned_ticket(app)
-    agent = client_as(app, "asha@cloudserve.example")
-    assert agent.post(f"/staff/tickets/{tid}/status", json={"status": "in_progress"}).status_code == 200
-    assert agent.post(f"/staff/tickets/{tid}/status", json={"status": "bogus"}).status_code == 422
-    assert agent.post(f"/staff/tickets/{tid}/resolve", json={"note": "solved on a call"}).status_code == 200
-    assert agent.get(f"/staff/tickets/{tid}").json()["work_status"] == "Resolved"
-    log = app.state.hub.pipeline.store.export(ticket_id=tid)
-    assert log[-1]["action_taken"] == "resolved_without_reply"
+def test_mark_resolved_without_a_reply_and_status_changes(ws):
+    hub, staff, boss, asha, ravi = ws
+    tid = assigned(hub, boss, asha)
+    hub.set_work_status(tid, "in_progress", asha)
+    with pytest.raises(ValueError):
+        hub.set_work_status(tid, "bogus", asha)
+    hub.resolve_without_reply(tid, asha, "solved on a call")
+    assert W.agent_view(hub, tid)["work_status"] == "Resolved"
+    assert hub.pipeline.store.export(ticket_id=tid)[-1]["action_taken"] == "resolved_without_reply"
 
 
-def test_only_the_assigned_agent_can_act(app):
-    tid = assigned_ticket(app)
-    ravi = client_as(app, "ravi@cloudserve.example")
-    assert ravi.post(f"/staff/tickets/{tid}/send", json={"text": "hi there"}).status_code == 403
-    sup = client_as(app, "boss@cloudserve.example")
-    assert sup.get(f"/staff/tickets/{tid}").status_code == 200                   # supervisors can look
-    assert sup.post(f"/staff/tickets/{tid}/send", json={"text": "hi there"}).status_code == 403
+def test_only_the_assigned_agent_can_act(ws):
+    hub, staff, boss, asha, ravi = ws
+    tid = assigned(hub, boss, asha)
+    for act in (lambda: hub.send(tid, ravi, "hi there"), lambda: hub.save_reply(tid, "hi", ravi),
+                lambda: hub.resolve_without_reply(tid, ravi), lambda: hub.set_work_status(tid, "in_progress", ravi),
+                lambda: hub.send(tid, boss, "hi there")):
+        with pytest.raises(PermissionError):
+            act()
+    assert W.agent_view(hub, tid)["can_send"]                                      # nothing changed
 
 
-# ================================================================= plain words, safe pages
+# ================================================================= plain words
 def test_plain_wording():
-    assert plain("Tier 2: RAG generation: the best article scored 0.259, relevant but below the 0.292 "
-                 "approved-content threshold.") == "Reply written from the help articles: based on how closely the " \
-                                                   "help article matches."
-    assert plain("Escalated to a person. No help article matched closely enough (best match scored 0.13; at least "
-                 "0.23 is needed).") == "No help article matched closely enough."
+    assert W.plain("Tier 2: RAG generation: the best article scored 0.259, relevant but below the 0.292 "
+                   "approved-content threshold.") == "Reply written from the help articles: based on how closely " \
+                                                     "the help article matches."
+    assert W.plain("Escalated to a person. No help article matched closely enough (best match scored 0.13; at "
+                   "least 0.23 is needed).") == "No help article matched closely enough."
 
 
-def test_screens_escape_ticket_text_and_use_no_jargon():
-    for name in ("login.html", "supervisor.html", "agent.html", "app.js"):
-        text = (WEB / name).read_text()
-        assert "RAG" not in text and "intent" not in text.lower().replace("intention", "")
-    assert "const esc = " in (WEB / "app.js").read_text()
+def test_streamlit_screens_use_no_jargon():
+    text = (Path(__file__).resolve().parents[1] / "streamlit_app.py").read_text()
+    shown = " ".join(s for s in __import__("re").findall(r'"([^"\n]*)"', text))
+    assert "RAG" not in shown and " intent" not in shown.lower()

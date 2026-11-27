@@ -2,7 +2,7 @@
 
 The pipeline's own vocabulary (intent, tier, retrieval, guardrail...) is translated here into the
 words a support team uses: topic, how it was handled, help articles, safety checks. The screens
-(src/web/) only display what these functions return.
+(streamlit_app.py) only display what these functions return.
 """
 from __future__ import annotations
 

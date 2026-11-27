@@ -268,7 +268,9 @@ def test_examples_do_what_their_labels_say(pipeline, threshold):
         assert o.outcome == expected, (name, threshold, o.reason)
 
 
-def test_root_is_the_staff_sign_in_and_docs_stay_available(client):
-    r = client.get("/")
-    assert r.status_code == 200 and "Staff sign-in" in r.text
+def test_root_opens_the_api_docs_and_the_api_has_no_screens(client):
+    r = client.get("/", follow_redirects=False)
+    assert r.status_code in (302, 307) and r.headers["location"] == "/docs"
     assert client.get("/docs").status_code == 200
+    for path in ("/supervisor", "/agent", "/dashboard", "/static/app.js", "/staff/me"):   # the UI is Streamlit only
+        assert client.get(path).status_code == 404, path

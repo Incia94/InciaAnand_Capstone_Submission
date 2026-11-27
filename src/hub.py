@@ -382,10 +382,21 @@ class SupportHub:
                                    prediction=agent["name"], run_id=t.get("run_id"), model_name="person")
         return self.tickets.get(ticket_id)
 
-    def save_reply(self, ticket_id: str, text: str) -> None:
+    def _assigned(self, ticket_id: str, agent: Optional[dict]) -> dict:
+        """The ticket, if `agent` may act on it: only the agent it is assigned to can."""
+        t = self.tickets.get(ticket_id)
+        if t is None:
+            raise LookupError(f"no ticket {ticket_id}")
+        if agent is not None and t.get("assignee") != agent.get("email"):
+            raise PermissionError(f"{ticket_id} is not assigned to {agent.get('name', 'you')}")
+        return t
+
+    def save_reply(self, ticket_id: str, text: str, agent: Optional[dict] = None) -> None:
+        self._assigned(ticket_id, agent)
         self.tickets.update(ticket_id, saved_reply=text, work_status="in_progress")
 
-    def set_work_status(self, ticket_id: str, status: str) -> None:
+    def set_work_status(self, ticket_id: str, status: str, agent: Optional[dict] = None) -> None:
+        self._assigned(ticket_id, agent)
         if status not in WORK_STATUSES:
             raise ValueError(f"status must be one of {WORK_STATUSES}")
         self.tickets.update(ticket_id, work_status=status)
@@ -394,9 +405,7 @@ class SupportHub:
         """Send the reply an agent checked. Unchanged: Cirrus's reply as it was prepared for the channel.
         Edited: exactly the agent's text, checked again first (src/review.py)."""
         from src.review import approve
-        t = self.tickets.get(ticket_id)
-        if t is None:
-            raise LookupError(f"no ticket {ticket_id}")
+        t = self._assigned(ticket_id, agent)
         prepared = (t.get("formatted") or {}).get("body") if isinstance(t.get("formatted"), dict) else None
         unchanged = prepared is not None and text.strip() == prepared.strip()
         p = self.pipeline
@@ -413,9 +422,7 @@ class SupportHub:
 
     def resolve_without_reply(self, ticket_id: str, agent: dict, note: str = "") -> dict:
         from src.review import close
-        t = self.tickets.get(ticket_id)
-        if t is None:
-            raise LookupError(f"no ticket {ticket_id}")
+        self._assigned(ticket_id, agent)
         res = close(self.pipeline.reviews, self.pipeline.store, ticket_id, agent["name"], note)
         self.tickets.update(ticket_id, status="resolved", work_status="resolved", resolved_by=agent["name"])
         return res

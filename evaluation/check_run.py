@@ -5,7 +5,8 @@
     python -m evaluation.check_run evaluation/results/eval-20261121T130722Z-86c8a8
 
 1. The run itself (pass or fail): the file was read, every ticket was processed with nobody
-   intervening, every ticket ended sent or escalated exactly once, and the decision log reconciles
+   intervening, every ticket ended exactly once (sent; answered with the reply held for an agent to
+   check, under REPLY_MODE=review; or escalated), and the decision log reconciles
    with the tickets. These are what make the unattended run count at all.
 2. The targets (met or not met): the Evaluation Framework's business, technical and governance
    targets. A run can pass while missing targets; the report says which and why.
@@ -31,14 +32,16 @@ def find_run(path: Path) -> Optional[Path]:
 def run_checks(m: dict) -> list[tuple[str, bool, str]]:
     run, rec = m.get("run", {}), m.get("reconcile", {})
     outcomes = rec.get("outcomes") or {}
-    ended = sum(outcomes.get(k, 0) for k in ("sent", "escalated"))
+    ended = sum(outcomes.values())
     expected = rec.get("tickets_expected", run.get("tickets_in_file"))
+    names = {"sent": "sent", "pending_review": "answered, reply held for an agent to check", "escalated": "escalated"}
+    detail = ", ".join(f"{n} {names.get(k, k.replace('_', ' '))}" for k, n in sorted(outcomes.items()))
     return [
         ("every ticket in the file was processed",
          run.get("tickets_processed") == run.get("tickets_in_file") and not run.get("interrupted"),
          f"{run.get('tickets_processed')} of {run.get('tickets_in_file')}"),
-        ("every ticket ended sent or escalated", ended == expected and not rec.get("missing_outcome"),
-         f"{outcomes.get('sent', 0)} sent, {outcomes.get('escalated', 0)} escalated"),
+        ("every ticket ended answered or escalated", ended == expected and not rec.get("missing_outcome"),
+         detail or "no outcomes"),
         ("no ticket has two outcomes", not rec.get("duplicate_outcome"), f"{len(rec.get('duplicate_outcome') or [])}"),
         ("every decision was logged (decision log reconciles)", bool(rec.get("reconciled")),
          f"{rec.get('decisions')} decisions, {rec.get('write_failures', 0)} write failures"),

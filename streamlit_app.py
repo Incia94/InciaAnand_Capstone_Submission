@@ -12,6 +12,8 @@ can run at once and show the same tickets. Demo accounts are created on first us
 """
 from __future__ import annotations
 
+import secrets
+
 import altair as alt
 import pandas as pd
 import streamlit as st
@@ -47,7 +49,10 @@ def header():
     left.caption("Powered by CloudServe Solutions · Support workspace")
     if user:
         right.markdown(f"**{user['name']}**  \n{user['team']} · {user['role'].capitalize()}")
-        if right.button("Sign out", width="stretch"):
+        b1, b2 = right.columns(2)
+        if b1.button("Refresh", width="stretch", help="Show tickets that arrived since this page loaded"):
+            st.rerun()
+        if b2.button("Sign out", width="stretch"):
             st.session_state.clear()
             st.rerun()
     st.divider()
@@ -99,8 +104,9 @@ def supervisor():
         if top[1].button("Add sample tickets", width="stretch",
                          help="Simulated tickets from email, live chat, the forum and docs comments"):
             with st.spinner("Cirrus is reading the new tickets…"):
-                n = len(hub.simulate(count=8))
-            st.toast(f"{n} sample tickets arrived.")
+                arrived = hub.simulate(count=8, seed=secrets.randbelow(10**9))       # a fresh set each click
+                n = sum(1 for r in arrived if not r.get("duplicate_delivery"))
+            st.toast(f"{n} sample tickets arrived." if n else "Those tickets were already in the queue.")
             st.rerun()
         tickets = W.queue(hub, which.lower())
         if not tickets:

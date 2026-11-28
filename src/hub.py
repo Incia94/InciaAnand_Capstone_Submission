@@ -445,3 +445,81 @@ class SupportHub:
         from src.channels import simulate
         run_id = run_id or f"sim-{uuid.uuid4().hex[:6]}"
         return [self.receive(ch, payload, run_id=run_id) for ch, payload in simulate(count, seed)]
+
+    def load(self, tickets: list[dict], run_id: Optional[str] = None) -> list[dict]:
+        """Bring real tickets (dataset records) into the queue, each through its own channel. Loading the
+        same file again adds nothing: every ticket keeps the same delivery reference."""
+        from src.channels import render
+        run_id = run_id or f"load-{uuid.uuid4().hex[:6]}"
+        return [self.receive(*render(t), run_id=run_id) for t in tickets]
+
+
+# ---------------------------------------------------------------- terminal: start over, load tickets
+def read_tickets(path: Path) -> list[dict]:
+    """A ticket file as the evaluation reads it: a JSON list, {"tickets": [...]}, or JSON Lines."""
+    text = path.read_text(encoding="utf-8").strip()
+    if text.startswith("[") or text.startswith("{\"tickets\""):
+        data = json.loads(text)
+        return data["tickets"] if isinstance(data, dict) else data
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+def store_paths() -> dict[str, Path]:
+    """Where the live queue keeps its data (the same settings the API and Streamlit use)."""
+    from src.logging_store import DEFAULT_URL, _sqlite_path
+    decisions = Path(_sqlite_path(os.getenv("DATABASE_URL", DEFAULT_URL)))
+    return {"tickets": Path(os.getenv("TICKETS_DB") or decisions.with_name("tickets.db")),
+            "replies waiting for review": Path(os.getenv("REVIEW_DB") or decisions.with_name("reviews.db")),
+            "decision log": decisions}
+
+
+def main(argv: Optional[list] = None) -> int:
+    import argparse
+    import sys
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
+    p = argparse.ArgumentParser(prog="python -m src.hub", description="The live ticket queue the staff screens show.")
+    sub = p.add_subparsers(dest="command", required=True)
+    sub.add_parser("reset", help="delete every ticket, waiting reply and logged decision (asks you to confirm)")
+    ld = sub.add_parser("load", help="bring tickets from a file into the queue, each through its own channel")
+    ld.add_argument("file", type=Path, help="a JSON list, {\"tickets\": [...]}, or JSON Lines")
+    ld.add_argument("--count", type=int, help="only the first N tickets")
+    ld.add_argument("--skip", type=int, default=0, help="start after the first N tickets")
+    args = p.parse_args(argv)
+
+    if args.command == "reset":
+        paths = store_paths()
+        print("This deletes, for the staff screens and the API:")
+        for what, path in paths.items():
+            print(f"  {what:<27} {path}{'' if path.exists() else '  (empty already)'}")
+        print("Evaluation runs keep their own files in evaluation/results and are not touched.")
+        if input("Type reset to continue: ").strip().lower() != "reset":
+            print("Nothing deleted.")
+            return 1
+        for path in paths.values():
+            for f in (path, path.with_name(path.name + "-wal"), path.with_name(path.name + "-shm")):
+                f.unlink(missing_ok=True)
+        print("Done. Restart Streamlit (and the API, if it is running) so they start from the empty queue.")
+        return 0
+
+    if not args.file.is_file():
+        print(f"No such file: {args.file}", file=sys.stderr)
+        return 1
+    tickets = read_tickets(args.file)[args.skip:]
+    tickets = tickets[:args.count] if args.count else tickets
+    from src.api import SupportPipeline
+    hub = SupportHub(SupportPipeline.from_env())
+    print(f"Loading {len(tickets)} ticket(s) from {args.file}...")
+    results = hub.load(tickets)
+    new = [r for r in results if not r.get("duplicate_delivery")]
+    print(f"Added {len(new)} ticket(s) to the queue"
+          f"{f'; {len(results) - len(new)} were already there' if len(new) < len(results) else ''}. "
+          "Click Refresh in Streamlit (or press R) to see them.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

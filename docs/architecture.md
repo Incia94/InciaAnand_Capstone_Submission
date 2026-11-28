@@ -1,65 +1,81 @@
-# Cirrus AI: the support resolution hub
+# Cirrus AI architecture
 
-One support intelligence engine for CloudServe. It serves two audiences from the same core:
+Cirrus AI has two interactive entry points and one batch entry point. The Streamlit dashboard and FastAPI call the same support hub and use the same configured stores. The evaluation harness calls the underlying LangGraph pipeline directly and scores each input ticket independently.
 
-- **customers**, on four channels: email, live chat, the community forum and documentation comments;
-- **CloudServe employees**, through one dashboard and API for every channel.
+## System overview
 
 ```mermaid
 flowchart TD
-    subgraph Channels["Four channels (native payloads)"]
-        E[Email] --- C[Live chat] --- F[Community forum] --- D[Docs comments]
-    end
-    Channels -->|"src/channels.py adapters"| U["Unified ticket schema<br/>src/ingest.py NormalisedTicket"]
-    U --> H["Conversation history<br/>(same thread)"]
-    H --> X{"Cross-channel<br/>duplicate?"}
-    X -->|yes| M["Merge into the open ticket<br/>(fixed reply, no model)"]
-    X -->|no| P
-    subgraph P["Pipeline: src/api.py (LangGraph)"]
-        S[Scope screen<br/>Tier 0] --> CL[Classify<br/>TF-IDF + LR] --> R[Hybrid search<br/>Chroma + MiniLM + BM25] --> RT[Route] --> T[Tier and<br/>channel policy]
-        T -->|Tier 1| A1[Approved article steps]
-        T -->|Tier 2| A2[RAG answer, cited]
-        T -->|Tier 3| A3[Agent, with a cited draft]
-        A1 --> G[Guardrails]
-        A2 --> G
-    end
-    P --> FMT["Channel-aware formatting<br/>src/formatting.py"]
-    M --> FMT
-    FMT --> TS[("Central ticket storage<br/>tickets + messages")]
-    FMT --> RV[("Review queue<br/>REPLY_MODE=review")]
-    P --> LOG[("Decision log<br/>every step, governance format")]
-    TS --> SUP["Supervisor: queue, assign, reports<br/>(Streamlit)"]
-    LOG --> SUP
-    SUP -->|"assign"| AG["Agent: my tickets, check and send<br/>(Streamlit)"]
-    RV --> AG
-    AG -->|"send, edit, resolve"| RV
+    Channels["Email, chat, forum, docs comments"] --> API["FastAPI and channel adapters"]
+    API --> Hub["SupportHub"]
+    Staff["Streamlit staff workspace"] --> Hub
+    Hub -->|New request| Graph["LangGraph support pipeline"]
+    Hub -->|Duplicate| Tickets["SQLite tickets and thread history"]
+    Graph -->|Live outcome via hub| Tickets
+    Graph --> Review["SQLite review queue"]
+    Graph --> Log["SQLite decision log"]
+    Staff -->|Reads| Tickets
+    Staff -->|Reads| Review
+    Staff -->|Reads| Log
+    Docs["Knowledge-base articles and index"] --> Graph
 ```
 
-## Features and where they live
+The API accepts unified tickets and native channel payloads. Streamlit calls Python services in its own process, so it can run independently of FastAPI. In the demo, the hub records approved replies and returns the content for delivery. Email, chat, forum, and docs-comment connectors would perform the external delivery.
 
-| Feature | Priority | Where | How it works |
-|---|---|---|---|
-| Unified ticket schema | P0 | `src/ingest.py` (`NormalisedTicket`) | Every channel becomes the same ticket: text, channel, customer (id, name, contact address and a hashed `customer_key`), thread, language and flags. The name and address are kept for the record and never put in the text the models read. |
-| Common ticket processing API | P0 | `src/api.py` | `POST /tickets` takes a unified ticket. `POST /channels/{email,chat,forum,docs_comment}` takes a channel's own payload. Both go through the same hub and pipeline. |
-| Channel-aware response formatting | P0 | `src/formatting.py` | One checked reply, laid out per channel. **Email:** subject, greeting, full article links, ticket reference, signature. **Chat:** first three steps plus compact links. **Forum:** public Markdown, no ticket reference, moderator note. **Docs comment:** first two steps plus the article link. Only fixed text is added, so the guardrails' verdict still holds. |
-| Centralised ticket storage | P0 | `src/hub.py` (`TicketStore`) | `tickets.db`, beside the decision log, holds every ticket's status, handling, reply and duplicate link. Every message is kept per ticket and per customer. Personal data in the text is masked. |
-| Decision logging | P0 | `src/logging_store.py` | Every step of every ticket is logged: deduplication, ingest, screen, classification, retrieval, routing, tier, generation, validation, outcome and human review. Records follow the Governance Framework format (`export`), and the coverage check reconciles both counts and paths. |
-| Simulated four-channel ingestion | P0 | `src/channels.py` | `simulate()` renders dataset tickets as native email, chat, forum and docs-comment payloads. It adds a cross-channel duplicate and a same-session follow-up. Run it with `python -m src.channels simulate --post URL` or `POST /hub/simulate`. |
-| Unified employee dashboard | P1 | `streamlit_app.py` (Streamlit), over `src/workspace.py`, `src/hub.py` and `src/staff.py` | Staff sign in on the Streamlit app's first screen. **Supervisors** see every ticket from every channel, unassigned and assigned. They assign tickets to agents and see Reports: ticket volume, tickets by channel, how tickets were handled, and the decision log (one line per ticket, every step on click). **Agents** see only their own tickets. Each one shows the customer report, Cirrus's findings with the help articles, and the suggested reply with its citations. The agent checks or edits it, then sends it or marks the ticket resolved. Everything on screen is in plain words. |
-| Cross-channel deduplication | P1 | `src/hub.py` (`_duplicate_of`) | A ticket is merged into an earlier one when: same `customer_key`; the earlier ticket is still open; it arrived within `DEDUP_WINDOW_HOURS`; it's in a different thread; and the texts are at least `DEDUP_SIMILARITY` alike (character n-gram TF-IDF cosine). The duplicate is logged as its own ticket, with ingest, dedup and outcome `merged`. |
-| Conversation history | P1 | `src/hub.py`, `src/scope.py` | Earlier messages in the same thread are attached to each new message. If the customer says the earlier answer didn't work, the ticket goes to an agent, with the earlier question used to find the right articles. `GET /customers/{key}/history` returns a customer's history across channels. |
+## Live ticket flow
 
-## Running it
+1. **Intake.** [`api.py`](../src/api.py) accepts `POST /tickets` or `POST /channels/{channel}`. The latter uses [`channels.py`](../src/channels.py) to adapt a native payload. Streamlit's **Add sample tickets** action uses the same hub with simulated channel payloads.
+2. **History and deduplication.** [`hub.py`](../src/hub.py) normalizes the ticket, attaches messages from the same thread, and checks for a matching open issue from the same customer. A matching issue is merged and logged. For a new issue, `SupportHub.handle()` calls `SupportPipeline.run()`.
+3. **Processing.** The graph normalizes and screens the request. For an in-scope support ticket, it can translate the ticket, classify intent and urgency, retrieve relevant evidence, and choose between a reply and a human handoff.
+4. **Outcome and persistence.** Drafted replies go through guardrails. The hub formats replies for the channel, stores the ticket and conversation, and exposes its evidence and decision trail to the workspace. Reviewable replies and escalations can appear in the review queue.
+5. **Staff action.** A supervisor assigns the ticket. The assigned agent reviews the sources and can save, approve, edit, or close the ticket from the dashboard. [`review.py`](../src/review.py) checks edited replies before approval and logs the action. [`workspace.py`](../src/workspace.py) prepares the dashboard views and reports.
 
-```bash
-streamlit run streamlit_app.py         # the support workspace in Streamlit: http://localhost:8501
-python -m src.api                      # the API only (no screens): http://127.0.0.1:8000/docs
-python -m src.channels simulate --count 12 --post http://127.0.0.1:8000
-./run.sh data/validation_tickets.json  # unattended evaluation of any ticket file
+## Pipeline branches
+
+```mermaid
+flowchart TD
+    Ingest["Normalize ticket"] --> Screen["Screen scope"]
+    Screen -->|Fixed response| Fixed["Approved conversational reply"]
+    Screen -->|Support request| Classify["Translate if needed and classify"]
+    Classify --> Retrieve["Retrieve cited passages"]
+    Retrieve --> Route{"Route using intent and evidence"}
+    Route -->|Eligible to answer| Tier{"Apply tier and channel policy"}
+    Route -->|Human handling| Handoff["Agent handoff with evidence"]
+    Tier -->|Draft allowed| Draft["Build cited reply"]
+    Tier -->|Agent required| Handoff
+    Draft -->|Insufficient evidence| Handoff
+    Draft -->|Answer available| Check{"Guardrails pass?"}
+    Check -->|Blocked| Handoff
+    Check -->|Passed| Release["Hold for review or mark sent"]
 ```
 
-The evaluation harness runs the pipeline on its own. Deduplication and storage belong to the live hub, so every evaluated ticket is scored on its own merits.
+Start in `SupportPipeline._build_graph()` in [`src/api.py`](../src/api.py) to trace the transitions. [`route.py`](../src/route.py) makes the answer-or-escalate decision. [`policy.py`](../src/policy.py) applies rollout and channel limits. [`generate.py`](../src/generate.py) builds replies from evidence, and [`guardrail.py`](../src/guardrail.py) checks them before release. The graph also logs errors and can escalate when the kill switch is active. Every graph path reaches outcome logging.
 
-Staff sign in with a username: `marcus` (supervisor; `admin` also works) or `asha`, `sofia`, `ravi` (agents). These four accounts are created when a person runs `python -m src.staff demo` and types a shared password at the prompt (twice). Passwords are never read from code, `.env` or any setting, and the workspace never creates accounts by itself. Only a salted hash of each password is stored, in `storage/staff.json`, which git ignores. Other accounts are created at the terminal with `python -m src.staff add`, which asks for the username, name, team and role, then the password (twice, hidden). `python -m src.staff reset-password <username>` sets a new password, `python -m src.staff remove <username>` deletes an account after you type the username to confirm, and `python -m src.staff list` shows the accounts, never the passwords. Streamlit keeps the signed-in person in that browser's session. The hub itself refuses any action on a ticket by an agent it is not assigned to (`SupportHub._assigned`), so the rule holds whatever screen calls it; supervisors can look at any ticket but do not send replies.
+| Resolution tier | What happens |
+| --- | --- |
+| **0 · Fixed reply** | Rules handle greetings, out-of-scope messages, and other supported conversational cases with approved text. |
+| **1 · Approved content** | A strong article match supplies cited resolution steps. |
+| **2 · Retrieval-augmented reply** | Cirrus drafts a cited answer from relevant passages. The extractive generator provides a key-free fallback. |
+| **3 · Human handling** | An agent gets a handoff and, when evidence permits, a cited draft. |
 
-The machine API (`/tickets`, `/channels/*`, `/hub/*`, `/reviews/*`, `/search`) is not behind staff sign-in. It's meant for channel connectors on a trusted network; on a public network it would need its own authentication.
+With `REPLY_MODE=review`, eligible support replies are held for approval. Channel policy operates earlier in the graph. Tier 2 email cases go to an agent, while forum automation is limited to documentation and related thread pointers. `CHANNEL_POLICY=uniform` applies live-chat-style routing limits across channels for comparison.
+
+## Data and storage
+
+| Store | Default location | Contents |
+| --- | --- | --- |
+| Knowledge base | [`data/documentation.json`](../data/documentation.json) | Approved source articles used for retrieval and citations. |
+| Dense index | `storage/chroma/` | Article embeddings used by dense or hybrid search. Lexical retrieval can use the corpus directly. |
+| Classifier and thresholds | `storage/models/classifier.joblib`, `storage/retrieval.json`, `storage/routing.json` | Trained intent and urgency models and calibrated retrieval and routing settings. |
+| Ticket store | `storage/tickets.db` | Tickets, messages, duplicate links, assignments, and status. |
+| Review queue | `storage/reviews.db` | Held replies, escalations, and review state. |
+| Decision log | `storage/decisions.db` | Stage decisions, reasons, evidence, and outcomes. |
+| Staff directory | `storage/staff.json` | Staff identities, roles, and salted password hashes. |
+
+See [`.env.example`](../.env.example) for path overrides. The default ticket and review databases are located beside the decision log. Staff sign-in applies to the Streamlit workspace. The machine API is intended for local use or trusted integrations and requires authentication before public deployment.
+
+## Batch evaluation flow
+
+[`run.sh`](../run.sh) invokes [`evaluation/harness.py`](../evaluation/harness.py). The harness prepares missing artifacts with development data, reads the evaluation file, and calls `SupportPipeline.run()` for each record. Calling the graph directly gives each input ticket its own evaluation outcome before any live-hub deduplication or staff assignment. The harness writes per-ticket outcomes and a run-specific decision log, computes metrics, and optionally invokes [`evaluation/judge.py`](../evaluation/judge.py) to assess replies.
+
+[`evaluation/check_run.py`](../evaluation/check_run.py) checks completion, outcome accounting, and decision-log reconciliation. The metric report evaluates quality targets separately. See [the evaluation commands](../README.md#run-an-evaluation) for validation, smoke, and hidden-set runs.

@@ -1,7 +1,5 @@
 # Cirrus AI architecture
 
-[Back to the README](../README.md)
-
 Cirrus AI has two interactive entry points and one batch entry point. The Streamlit dashboard and FastAPI call the same support hub and use the same configured stores. The evaluation harness calls the underlying LangGraph pipeline directly and scores each input ticket independently.
 
 ## System overview

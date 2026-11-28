@@ -31,7 +31,6 @@ def services():
     from src.hub import SupportHub
     from src.staff import StaffDirectory
     staff = StaffDirectory()
-    staff.ensure_demo()
     return SupportHub(SupportPipeline.from_env()), staff
 
 
@@ -86,8 +85,8 @@ def sign_in():
         st.caption("Supervisor: **marcus** · Agents: **asha**, **sofia**, **ravi**")
     if not staff.list():
         with mid:
-            st.warning("No staff accounts yet. Set DEMO_PASSWORD in your .env file and restart, "
-                       "or add accounts with `python -m src.staff add`.")
+            st.warning("No staff accounts yet. In a terminal, run `python -m src.staff demo` and type a "
+                       "password; then sign in here.")
 
 
 # ---------------------------------------------------------------- supervisor

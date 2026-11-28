@@ -1,16 +1,20 @@
 """The Streamlit workspace (streamlit_app.py), driven headlessly: demo sign-in by username, the
-supervisor assigns sample tickets and sees the reports, and the agent sends Cirrus's cited reply."""
+supervisor assigns sample tickets and sees the reports, and the agent sends Cirrus's cited reply.
+
+Accounts are made the only way they can be: `python -m src.staff demo`, with a person typing the
+password at the prompt (here, the two prompts are answered by the test)."""
 import sqlite3
 from pathlib import Path
 
 import pytest
 
+from src import staff as S
 from src.staff import StaffDirectory
 from tests import fakes
 
 APP = str(Path(__file__).resolve().parents[1] / "streamlit_app.py")
 AppTest = pytest.importorskip("streamlit.testing.v1").AppTest
-DEMO = fakes.password()                         # the demo password for this run, as if set in .env
+DEMO = fakes.password()                         # the password "typed" at the prompt for this run
 WRONG = fakes.password()
 
 
@@ -19,9 +23,8 @@ def env(tmp_path, monkeypatch):
     for k, v in dict(RETRIEVAL_BACKEND="lexical", GENERATOR="extractive", STAFF_FILE=tmp_path / "staff.json",
                      DATABASE_URL=f"sqlite:///{tmp_path / 'decisions.db'}", REVIEW_DB=tmp_path / "reviews.db",
                      TICKETS_DB=tmp_path / "tickets.db", KILL_SWITCH_FILE=tmp_path / "KS", REPLY_MODE="review",
-                     OPENROUTER_API_KEY="", DEMO_PASSWORD=DEMO).items():
+                     OPENROUTER_API_KEY="").items():
         monkeypatch.setenv(k, str(v))
-    monkeypatch.delenv("DEMO_ACCOUNTS", raising=False)
     import streamlit as st
     st.cache_resource.clear()                       # each test gets a hub over its own temporary files
     yield tmp_path
@@ -39,9 +42,23 @@ def labelled(at, label):
     return [b for b in at.button if b.label == label]
 
 
-def test_demo_accounts_and_usernames(env):
+def typed(monkeypatch, *answers):
+    """Answer the password prompts as a person at the terminal would."""
+    replies = iter(answers)
+    monkeypatch.setattr(S.getpass, "getpass", lambda prompt="": next(replies))
+
+
+def demo_accounts(monkeypatch):
+    typed(monkeypatch, DEMO, DEMO)
+    assert S.main(["demo"]) == 0
+
+
+def test_demo_accounts_are_made_only_by_a_person_at_the_prompt(env, monkeypatch):
+    assert StaffDirectory().list() == []                                 # nothing is created by itself
+    at = AppTest.from_file(APP, default_timeout=300).run()
+    assert any("python -m src.staff demo" in w.value for w in at.warning)
+    demo_accounts(monkeypatch)
     s = StaffDirectory()
-    assert len(s.ensure_demo()) == 4 and s.ensure_demo() == []            # created once, then left alone
     assert s.check("marcus", DEMO)["role"] == "supervisor"
     assert s.check("Admin", DEMO)["name"] == "Marcus Adeyemi"
     assert [s.check(n, DEMO)["role"] for n in ("asha", "Sofia", "ravi@cloudserve.example")] == ["agent"] * 3
@@ -49,17 +66,20 @@ def test_demo_accounts_and_usernames(env):
     assert DEMO not in (env / "staff.json").read_text()                     # salted hashes only
 
 
-def test_no_demo_accounts_when_turned_off(env, monkeypatch):
-    monkeypatch.setenv("DEMO_ACCOUNTS", "off")
-    assert StaffDirectory().ensure_demo() == [] and StaffDirectory().list() == []
+def test_mismatched_or_short_passwords_save_nothing(env, monkeypatch):
+    typed(monkeypatch, DEMO, WRONG)
+    assert S.main(["demo"]) == 1 and StaffDirectory().list() == []
+    typed(monkeypatch, "short", "short")
+    assert S.main(["demo"]) == 1 and StaffDirectory().list() == []
 
 
-def test_no_demo_accounts_without_a_password_in_env(env, monkeypatch):
-    monkeypatch.delenv("DEMO_PASSWORD")
-    assert StaffDirectory().ensure_demo() == [] and StaffDirectory().list() == []     # nothing falls back to code
+def test_no_password_comes_from_code_or_settings():
+    source = Path(S.__file__).read_text() + (Path(__file__).resolve().parents[1] / ".env.example").read_text()
+    assert "DEMO_PASSWORD" not in source and "STAFF_PASSWORD" not in source and "ensure_demo" not in source
 
 
-def test_supervisor_assigns_and_agent_sends_in_streamlit(env):
+def test_supervisor_assigns_and_agent_sends_in_streamlit(env, monkeypatch):
+    demo_accounts(monkeypatch)
     bad = sign_in("marcus", WRONG)
     assert "Wrong username or password." in [e.value for e in bad.error]
 
@@ -86,7 +106,8 @@ def test_supervisor_assigns_and_agent_sends_in_streamlit(env):
     assert row == ("resolved", "resolved")
 
 
-def test_agent_cannot_open_the_supervisor_screen(env):
+def test_agent_cannot_open_the_supervisor_screen(env, monkeypatch):
+    demo_accounts(monkeypatch)
     agent = sign_in("ravi")
     assert not labelled(agent, "Add sample tickets") and not labelled(agent, "Assign")
     assert "My tickets" in " ".join(m.value for m in agent.markdown)

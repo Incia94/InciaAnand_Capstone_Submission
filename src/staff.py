@@ -7,19 +7,22 @@ with `check` and keeps the signed-in person in that browser session.
 Staff sign in with their username (the part of the email before @, or their first name; "admin" is
 the supervisor) or their full email.
 
-Demo accounts: the four demo accounts below are created on first use with the shared password set
-as DEMO_PASSWORD in your .env file (which git ignores). No password is written in the code: without
-DEMO_PASSWORD, no demo accounts are made. DEMO_ACCOUNTS=off turns them off; add real accounts with
-`python -m src.staff add` before anyone else uses the workspace.
+Passwords are only ever typed in by a person, at the prompt of the commands below. None is read
+from code, from .env or from any other setting, and none is stored except as a hash. The demo
+accounts (DEMO_STAFF: one supervisor, three agents) are created only when someone runs
+`python -m src.staff demo` and types the shared password; the workspace never creates accounts.
 
 Roles
   supervisor  sees every ticket from every channel, assigns them to agents, sees the reports and the
               decision log
   agent       sees the tickets assigned to them, checks Cirrus's suggested reply, edits it and sends it
 
-    python -m src.staff add --email asha@cloudserve.example --name "Asha" --team "API Support" --role agent
-    python -m src.staff demo        # (re)create the demo accounts with DEMO_PASSWORD from .env, or one you type
-    python -m src.staff list
+    python -m src.staff add                     # asks for username, name, team, role, then the password
+    python -m src.staff add priya --name "Priya Shah" --team Billing --role agent   # same, fewer questions
+    python -m src.staff reset-password priya    # asks for the new password
+    python -m src.staff remove priya            # asks you to type the username to confirm
+    python -m src.staff list                    # usernames, names, teams, roles; never passwords
+    python -m src.staff demo                    # create (or reset) the four demo accounts, one shared password
 """
 from __future__ import annotations
 
@@ -29,6 +32,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import sys
 import threading
@@ -87,6 +91,24 @@ class StaffDirectory:
             self._save(data)
         return self.get(email)
 
+    def set_password(self, email: str, password: str) -> None:
+        if len(password) < 8:
+            raise ValueError("the password must be at least 8 characters")
+        salt = secrets.token_bytes(16)
+        with self._lock:
+            data = self._load()
+            if email not in data:
+                raise ValueError(f"no account {email}")
+            data[email].update(salt=salt.hex(), hash=_hash(password, salt))
+            self._save(data)
+
+    def remove(self, email: str) -> None:
+        with self._lock:
+            data = self._load()
+            if data.pop(email, None) is None:
+                raise ValueError(f"no account {email}")
+            self._save(data)
+
     def resolve(self, login: str) -> Optional[str]:
         """The account email for a sign-in name: the email itself, the part before @, the first name,
         or "admin" for the supervisor. None unless exactly one account matches."""
@@ -101,20 +123,6 @@ class StaffDirectory:
             if len(found) == 1:
                 return found[0]
         return None
-
-    def ensure_demo(self) -> list[str]:
-        """Create any missing demo account, with the password from DEMO_PASSWORD (.env). Existing
-        accounts are left alone. Nothing happens without DEMO_PASSWORD or with DEMO_ACCOUNTS=off."""
-        password = os.getenv("DEMO_PASSWORD", "")
-        if not password or os.getenv("DEMO_ACCOUNTS", "on").strip().lower() in ("off", "0", "false", "no"):
-            return []
-        have = self._load()
-        made = []
-        for email, name, team, role in DEMO_STAFF:
-            if email not in have:
-                self.add(email, name, team, role, password)
-                made.append(email)
-        return made
 
     def get(self, email: str) -> Optional[dict]:
         u = self._load().get(self.resolve(email) or "")
@@ -133,41 +141,123 @@ class StaffDirectory:
         return self.get(u["email"]) if ok else None
 
 
+DOMAIN = "cloudserve.example"
+_USERNAME = re.compile(r"^[a-z][a-z0-9._-]{1,31}$")
+
+
+def email_for(username: str) -> str:
+    """A username becomes <username>@cloudserve.example; a full email address is kept as it is."""
+    username = (username or "").strip().lower()
+    return username if "@" in username else f"{username}@{DOMAIN}"
+
+
+def ask_password(label: str) -> Optional[str]:
+    """Ask a person for a password twice, without showing it. Nothing else can supply it."""
+    first = getpass.getpass(f"{label} (at least 8 characters): ")
+    if getpass.getpass("Type it again: ") != first:
+        print("The two passwords did not match; nothing was saved.", file=sys.stderr)
+        return None
+    return first
+
+
+def ask(label: str, given: Optional[str] = None, choices: Sequence[str] = (), required: bool = True) -> str:
+    """A value from the command line if given, otherwise typed at a prompt (asked again until valid)."""
+    if given is not None and (not choices or given in choices):
+        return given.strip()
+    hint = f" ({' / '.join(choices)})" if choices else ""
+    while True:
+        value = input(f"{label}{hint}: ").strip()
+        if choices and value.lower() not in choices:
+            print(f"  Please type one of: {', '.join(choices)}.")
+            continue
+        if required and not value:
+            print("  This is needed.")
+            continue
+        return value.lower() if choices else value
+
+
+def _add(staff: "StaffDirectory", args) -> int:
+    username = ask("Username (what they type to sign in, e.g. priya)", args.username)
+    if "@" not in username and not _USERNAME.match(username.lower()):
+        print("A username is 2-32 characters: lowercase letters, digits, '.', '_' or '-', starting with a letter.",
+              file=sys.stderr)
+        return 1
+    email = email_for(username)
+    if email in staff._load():
+        print(f"{email} already exists. To change its password: python -m src.staff reset-password "
+              f"{email.split('@')[0]}", file=sys.stderr)
+        return 1
+    name = ask("Full name", args.name)
+    team = ask("Team (e.g. API Support)", args.team, required=False)
+    role = ask("Role", args.role, choices=ROLES)
+    password = ask_password(f"Password for {email.split('@')[0]}")
+    if password is None:
+        return 1
+    u = staff.add(email, name, team, role, password)
+    print(f"Created {u['role']} '{email.split('@')[0]}' ({u['name']}{' · ' + u['team'] if u['team'] else ''}). "
+          f"They sign in with the username {email.split('@')[0]} and the password you typed.")
+    return 0
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         from dotenv import load_dotenv
         load_dotenv()
     except ImportError:
         pass
-    p = argparse.ArgumentParser(prog="python -m src.staff", description="Staff accounts for the support workspace.")
+    p = argparse.ArgumentParser(prog="python -m src.staff", description="Staff accounts for the support workspace. "
+                                "Every password is typed at the prompt; none can be passed any other way.")
     sub = p.add_subparsers(dest="command", required=True)
-    a = sub.add_parser("add", help="add or update an account (asks for the password)")
-    a.add_argument("--email", required=True)
-    a.add_argument("--name", required=True)
-    a.add_argument("--team", default="")
-    a.add_argument("--role", choices=ROLES, required=True)
-    sub.add_parser("demo", help="(re)create the demo supervisor and three agents with one shared password")
+    a = sub.add_parser("add", help="create an account; asks for anything not given, then the password")
+    a.add_argument("username", nargs="?", help="what they type to sign in (or a full email address)")
+    a.add_argument("--name", help="full name")
+    a.add_argument("--team", help="team, e.g. API Support")
+    a.add_argument("--role", choices=ROLES)
+    r = sub.add_parser("reset-password", help="set a new password for an account (asks for it)")
+    r.add_argument("username")
+    rm = sub.add_parser("remove", help="delete an account (asks you to confirm)")
+    rm.add_argument("username")
+    sub.add_parser("demo", help="create (or reset) the demo supervisor and three agents with one shared password")
     sub.add_parser("list", help="the accounts (never the passwords)")
     args = p.parse_args(argv)
     staff = StaffDirectory()
-    if args.command == "list":
-        for u in staff.list():
-            print(f"{u['role']:<11} {u['email']:<34} {u['name']} · {u['team']}")
-        return 0
-    if args.command == "demo":
-        password = (os.getenv("STAFF_PASSWORD") or os.getenv("DEMO_PASSWORD")
-                    or getpass.getpass("Demo password (at least 8 characters): "))
-    else:
-        password = os.getenv("STAFF_PASSWORD") or getpass.getpass("Password (at least 8 characters): ")
     try:
+        if args.command == "list":
+            users = staff.list()
+            if not users:
+                print("No accounts yet. Create one with: python -m src.staff add")
+            for u in users:
+                print(f"{u['role']:<11} {u['email'].split('@')[0]:<12} {u['name']}"
+                      f"{' · ' + u['team'] if u['team'] else ''}")
+            return 0
         if args.command == "add":
-            u = staff.add(args.email, args.name, args.team, args.role, password)
-            print(f"Saved {u['role']} {u['email']}.")
-        else:
-            for email, name, team, role in DEMO_STAFF:
-                staff.add(email, name, team, role, password)
-                print(f"Saved {role} {email.split('@')[0]:<7} ({name} · {team}).")
-            print("Sign in with a username (e.g. marcus, asha) and the demo password.")
+            return _add(staff, args)
+        if args.command in ("reset-password", "remove"):
+            email = staff.resolve(args.username)
+            if email is None:
+                print(f"No account '{args.username}'. See them with: python -m src.staff list", file=sys.stderr)
+                return 1
+            if args.command == "remove":
+                if input(f"Type {email.split('@')[0]} to delete this account: ").strip().lower() \
+                        != email.split("@")[0]:
+                    print("Not deleted.")
+                    return 1
+                staff.remove(email)
+                print(f"Deleted '{email.split('@')[0]}'.")
+                return 0
+            password = ask_password(f"New password for {email.split('@')[0]}")
+            if password is None:
+                return 1
+            staff.set_password(email, password)
+            print(f"Password changed for '{email.split('@')[0]}'.")
+            return 0
+        password = ask_password("Shared demo password")
+        if password is None:
+            return 1
+        for email, name, team, role in DEMO_STAFF:
+            staff.add(email, name, team, role, password)
+            print(f"Saved {role} {email.split('@')[0]:<7} ({name} · {team}).")
+        print("Sign in with a username (marcus, asha, sofia or ravi) and the password you typed.")
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 1

@@ -177,7 +177,7 @@ def ask(label: str, given: Optional[str] = None, choices: Sequence[str] = (), re
 
 
 def _add(staff: "StaffDirectory", args) -> int:
-    username = ask("Username (what they type to sign in, e.g. priya)", args.username)
+    username = ask("Username (name used to sign in:)", args.username)
     if "@" not in username and not _USERNAME.match(username.lower()):
         print("A username is 2-32 characters: lowercase letters, digits, '.', '_' or '-', starting with a letter.",
               file=sys.stderr)
@@ -195,7 +195,7 @@ def _add(staff: "StaffDirectory", args) -> int:
         return 1
     u = staff.add(email, name, team, role, password)
     print(f"Created {u['role']} '{email.split('@')[0]}' ({u['name']}{' · ' + u['team'] if u['team'] else ''}). "
-          f"They sign in with the username {email.split('@')[0]} and the password you typed.")
+          f"You sign in with the username {email.split('@')[0]} and the password you typed.")
     return 0
 
 
